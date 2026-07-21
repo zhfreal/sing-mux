@@ -1,10 +1,13 @@
 package mux
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
@@ -18,6 +21,11 @@ type clientConn struct {
 	destination    M.Socksaddr
 	requestWritten bool
 	responseRead   bool
+
+	client           *Client
+	ctx              context.Context
+	firstWriteBuffer []byte
+	retryCount       int
 }
 
 func (c *clientConn) NeedHandshake() bool {
@@ -39,16 +47,54 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 	if !c.responseRead {
 		err = c.readResponse()
 		if err != nil {
+			if c.client != nil && c.retryCount < 2 && len(c.firstWriteBuffer) > 0 {
+				c.retryCount++
+				c.client.Reset()
+				newStream, retryErr := c.client.openStream(context.Background())
+				if retryErr == nil {
+					c.Conn = newStream
+					c.requestWritten = false // Reset write state
+					_, writeErr := c.Write(c.firstWriteBuffer)
+					if writeErr == nil {
+						return c.Read(b)
+					}
+				}
+			}
 			return
 		}
 		c.responseRead = true
+		c.firstWriteBuffer = nil // Clear buffer to save memory
 	}
 	return c.Conn.Read(b)
 }
 
 func (c *clientConn) Write(b []byte) (n int, err error) {
+	if !c.responseRead && c.client != nil && c.retryCount < 2 {
+		// Limit buffer size to 4KB to prevent OOM
+		if len(c.firstWriteBuffer)+len(b) <= 4096 {
+			c.firstWriteBuffer = append(c.firstWriteBuffer, b...)
+		} else {
+			c.client = nil // Stop buffering, we can't retry if it exceeds 4KB
+		}
+	}
 	if c.requestWritten {
-		return c.Conn.Write(b)
+		n, err = c.Conn.Write(b)
+		if err != nil {
+			if c.client != nil && c.retryCount < 2 && len(c.firstWriteBuffer) > 0 {
+				c.retryCount++
+				retryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				newStream, retryErr := c.client.openStream(retryCtx)
+				if retryErr == nil {
+					c.Conn.Close()
+					c.Conn = newStream
+					c.requestWritten = false // Reset write state
+					// Re-write the buffered request
+					return c.Write(c.firstWriteBuffer)
+				}
+			}
+		}
+		return
 	}
 	request := StreamRequest{
 		Network:     N.NetworkTCP,
@@ -63,6 +109,18 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 	buffer.Write(b)
 	_, err = c.Conn.Write(buffer.Bytes())
 	if err != nil {
+		if c.client != nil && c.retryCount < 2 && len(c.firstWriteBuffer) > 0 {
+			c.retryCount++
+			retryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			newStream, retryErr := c.client.openStream(retryCtx)
+			if retryErr == nil {
+				c.Conn = newStream
+				c.requestWritten = false // Reset write state
+				// Re-write the buffered request
+				return c.Write(c.firstWriteBuffer)
+			}
+		}
 		return
 	}
 	c.requestWritten = true
@@ -89,8 +147,12 @@ func (c *clientConn) NeedAdditionalReadDeadline() bool {
 	return true
 }
 
-func (c *clientConn) Upstream() any {
-	return c.Conn
+
+func (c *clientConn) SyscallConn() (syscall.RawConn, error) {
+	if sc, ok := c.Conn.(syscall.Conn); ok {
+		return sc.SyscallConn()
+	}
+	return nil, syscall.ENOTSUP
 }
 
 var _ N.NetPacketConn = (*clientPacketConn)(nil)

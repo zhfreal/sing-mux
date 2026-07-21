@@ -87,7 +87,12 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 		if err != nil {
 			return nil, err
 		}
-		return &clientConn{Conn: stream, destination: destination}, nil
+		return &clientConn{
+			Conn:        stream,
+			destination: destination,
+			client:      c,
+			ctx:         ctx,
+		}, nil
 	case N.NetworkUDP:
 		stream, err := c.openStream(ctx)
 		if err != nil {
@@ -122,6 +127,7 @@ func (c *Client) openStream(ctx context.Context) (net.Conn, error) {
 		}
 		stream, err = session.Open(c.tcpTimeout)
 		if err != nil {
+			session.Close()
 			continue
 		}
 		break
@@ -242,7 +248,7 @@ func (c *Client) Reset() {
 	c.access.Lock()
 	defer c.access.Unlock()
 	for _, session := range c.connections.Array() {
-		session.Close()
+		go session.Close()
 	}
 	c.connections.Init()
 }
