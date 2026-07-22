@@ -65,7 +65,7 @@ func NewClient(options Options) (*Client, error) {
 		client.minStreams = 8
 	}
 	if client.tcpTimeout == 0 {
-		client.tcpTimeout = 5 * time.Second
+		client.tcpTimeout = 1 * time.Second
 	}
 	switch options.Protocol {
 	case "", "h2mux":

@@ -82,7 +82,7 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 		if err != nil {
 			if c.client != nil && c.retryCount < 2 && len(c.firstWriteBuffer) > 0 {
 				c.retryCount++
-				retryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				retryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				defer cancel()
 				newStream, retryErr := c.client.openStream(retryCtx)
 				if retryErr == nil {
@@ -111,7 +111,7 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 	if err != nil {
 		if c.client != nil && c.retryCount < 2 && len(c.firstWriteBuffer) > 0 {
 			c.retryCount++
-			retryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			retryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			newStream, retryErr := c.client.openStream(retryCtx)
 			if retryErr == nil {
