@@ -18,6 +18,6 @@ This repository contains local patches on top of version `v0.3.10` of `metacubex
    - Ensured failed sessions are closed cleanly if `session.Open` fails in `openStream()`.
 
 4. **Connection Setup & Retry Optimization (`client.go` & `client_conn.go`)**:
-   - Shortened default client `tcpTimeout` from `5 * time.Second` to `1 * time.Second` to reduce the time spent waiting on dead session streams.
-   - Reduced retry context timeout in `client_conn.go` from `10 * time.Second` to `2 * time.Second` to allow faster reconnection recovery on connection resets.
+   - Shortened default client `tcpTimeout` from `5 * time.Second` to `500 * time.Millisecond` to reduce the time spent waiting on dead session streams.
+   - Reduced retry context timeout in `client_conn.go` from `10 * time.Second` to `1 * time.Second` to allow faster reconnection recovery on connection resets.
 
