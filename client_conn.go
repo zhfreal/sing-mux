@@ -17,7 +17,17 @@ import (
 )
 
 type clientConn struct {
-	net.Conn
+	connMu sync.RWMutex
+	conn   net.Conn
+	closed bool // Prevents swapping if connection is closed during dial
+
+	dialMu sync.Mutex // Serializes network dials
+
+	stateMu          sync.Mutex // Protects concurrent access to handshake variables
+	requestWriteCond *sync.Cond
+	requestWriting   bool
+	responseReadCond *sync.Cond
+	responseReading  bool
 	destination    M.Socksaddr
 	requestWritten bool
 	responseRead   bool
@@ -28,12 +38,29 @@ type clientConn struct {
 	retryCount       int
 }
 
+func (c *clientConn) getConn() net.Conn {
+	c.connMu.RLock()
+	defer c.connMu.RUnlock()
+	return c.conn
+}
+
+func (c *clientConn) lazyInit() {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.requestWriteCond == nil {
+		c.requestWriteCond = sync.NewCond(&c.stateMu)
+		c.responseReadCond = sync.NewCond(&c.stateMu)
+	}
+}
+
 func (c *clientConn) NeedHandshake() bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	return !c.requestWritten
 }
 
 func (c *clientConn) readResponse() error {
-	response, err := ReadStreamResponse(c.Conn)
+	response, err := ReadStreamResponse(c.getConn())
 	if err != nil {
 		return err
 	}
@@ -43,92 +70,216 @@ func (c *clientConn) readResponse() error {
 	return nil
 }
 
-func (c *clientConn) Read(b []byte) (n int, err error) {
-	if !c.responseRead {
-		err = c.readResponse()
-		if err != nil {
-			if c.client != nil && c.retryCount < 2 && len(c.firstWriteBuffer) > 0 {
-				c.retryCount++
-				c.client.Reset()
-				newStream, retryErr := c.client.openStream(context.Background())
-				if retryErr == nil {
-					c.Conn = newStream
-					c.requestWritten = false // Reset write state
-					_, writeErr := c.Write(c.firstWriteBuffer)
-					if writeErr == nil {
-						return c.Read(b)
-					}
-				}
-			}
-			return
-		}
-		c.responseRead = true
-		c.firstWriteBuffer = nil // Clear buffer to save memory
+func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bool) {
+	c.connMu.RLock()
+	if c.conn != failedConn {
+		c.connMu.RUnlock()
+		return false, true
 	}
-	return c.Conn.Read(b)
+	c.connMu.RUnlock()
+
+	c.dialMu.Lock()
+	defer c.dialMu.Unlock()
+
+	c.connMu.RLock()
+	if c.conn != failedConn {
+		c.connMu.RUnlock()
+		return false, true
+	}
+	c.connMu.RUnlock()
+
+	c.stateMu.Lock()
+	if c.client == nil || c.retryCount >= 2 || c.responseRead {
+		c.stateMu.Unlock()
+		return false, false
+	}
+	c.retryCount++
+	c.requestWritten = false
+	client := c.client
+	c.stateMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	newStream, err := client.openStream(ctx)
+	if err != nil {
+		return false, false
+	}
+
+	c.connMu.Lock()
+	if c.closed {
+		c.connMu.Unlock()
+		newStream.Close()
+		return false, false
+	}
+	c.conn.Close()
+	c.conn = newStream
+	c.connMu.Unlock()
+	return true, true
+}
+
+func (c *clientConn) Read(b []byte) (n int, err error) {
+	c.lazyInit()
+	for {
+		c.stateMu.Lock()
+		for !c.responseRead && c.responseReading {
+			c.responseReadCond.Wait()
+		}
+		if c.responseRead {
+			c.stateMu.Unlock()
+			return c.getConn().Read(b)
+		}
+		c.responseReading = true
+		c.stateMu.Unlock()
+
+		err = c.readResponse()
+
+		c.stateMu.Lock()
+		c.responseReading = false
+		c.responseReadCond.Broadcast()
+		if err == nil {
+			c.responseRead = true
+			c.firstWriteBuffer = nil
+			c.stateMu.Unlock()
+			return c.getConn().Read(b)
+		}
+		c.stateMu.Unlock()
+
+		currentConn := c.getConn()
+		c.stateMu.Lock()
+		if c.client != nil {
+			c.client.Reset()
+		}
+		c.stateMu.Unlock()
+
+		swapped, ok := c.trySwapConnection(currentConn)
+		if ok {
+			if swapped {
+				c.stateMu.Lock()
+				writeBuf := c.firstWriteBuffer
+				c.stateMu.Unlock()
+
+				_, writeErr := c.write(writeBuf, true)
+				if writeErr == nil {
+					continue
+				}
+			} else {
+				// The connection was swapped and firstWriteBuffer was already replayed
+				// by the swapping thread. Return len(b), nil directly to prevent writing b twice.
+				return len(b), nil
+			}
+		}
+		return 0, err
+	}
 }
 
 func (c *clientConn) Write(b []byte) (n int, err error) {
-	if !c.responseRead && c.client != nil && c.retryCount < 2 {
-		// Limit buffer size to 4KB to prevent OOM
+	return c.write(b, false)
+}
+
+func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
+	c.lazyInit()
+	c.stateMu.Lock()
+	if !isReplay && !c.responseRead && c.client != nil && c.retryCount < 2 {
 		if len(c.firstWriteBuffer)+len(b) <= 4096 {
 			c.firstWriteBuffer = append(c.firstWriteBuffer, b...)
 		} else {
-			c.client = nil // Stop buffering, we can't retry if it exceeds 4KB
+			c.client = nil
 		}
 	}
-	if c.requestWritten {
-		n, err = c.Conn.Write(b)
-		if err != nil {
-			if c.client != nil && c.retryCount < 2 && len(c.firstWriteBuffer) > 0 {
-				c.retryCount++
-				retryCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-				defer cancel()
-				newStream, retryErr := c.client.openStream(retryCtx)
-				if retryErr == nil {
-					c.Conn.Close()
-					c.Conn = newStream
-					c.requestWritten = false // Reset write state
-					// Re-write the buffered request
-					return c.Write(c.firstWriteBuffer)
+	c.stateMu.Unlock()
+
+	writeBuf := b
+	for {
+		c.stateMu.Lock()
+		for !c.requestWritten && c.requestWriting {
+			c.requestWriteCond.Wait()
+		}
+		if c.requestWritten {
+			c.stateMu.Unlock()
+			currentConn := c.getConn()
+			n, err = currentConn.Write(writeBuf)
+			if err != nil {
+				swapped, ok := c.trySwapConnection(currentConn)
+				if ok {
+					if swapped {
+						c.stateMu.Lock()
+						writeBuf = c.firstWriteBuffer
+						c.stateMu.Unlock()
+						isReplay = true
+						continue
+					} else {
+						// The connection was swapped and firstWriteBuffer was already replayed
+						// by the swapping thread. Return len(b), nil directly to prevent writing b twice.
+						return len(b), nil
+					}
 				}
 			}
+			return n, err
 		}
-		return
-	}
-	request := StreamRequest{
-		Network:     N.NetworkTCP,
-		Destination: c.destination,
-	}
-	buffer := buf.NewSize(streamRequestLen(request) + len(b))
-	defer buffer.Release()
-	err = EncodeStreamRequest(request, buffer)
-	if err != nil {
-		return
-	}
-	buffer.Write(b)
-	_, err = c.Conn.Write(buffer.Bytes())
-	if err != nil {
-		if c.client != nil && c.retryCount < 2 && len(c.firstWriteBuffer) > 0 {
-			c.retryCount++
-			retryCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			defer cancel()
-			newStream, retryErr := c.client.openStream(retryCtx)
-			if retryErr == nil {
-				c.Conn = newStream
-				c.requestWritten = false // Reset write state
-				// Re-write the buffered request
-				return c.Write(c.firstWriteBuffer)
+		c.requestWriting = true
+		c.stateMu.Unlock()
+
+		currentConn := c.getConn()
+		request := StreamRequest{
+			Network:     N.NetworkTCP,
+			Destination: c.destination,
+		}
+		buffer := buf.NewSize(streamRequestLen(request) + len(writeBuf))
+		err = EncodeStreamRequest(request, buffer)
+		if err != nil {
+			buffer.Release()
+			c.stateMu.Lock()
+			c.requestWriting = false
+			c.requestWriteCond.Broadcast()
+			c.stateMu.Unlock()
+			return 0, err
+		}
+		buffer.Write(writeBuf)
+		_, err = currentConn.Write(buffer.Bytes())
+		buffer.Release()
+
+		c.stateMu.Lock()
+		c.requestWriting = false
+		c.requestWriteCond.Broadcast()
+		if err == nil {
+			c.requestWritten = true
+			c.stateMu.Unlock()
+			return len(b), nil
+		}
+		c.stateMu.Unlock()
+
+		swapped, ok := c.trySwapConnection(currentConn)
+		if ok {
+			if swapped {
+				c.stateMu.Lock()
+				writeBuf = c.firstWriteBuffer
+				c.stateMu.Unlock()
+				isReplay = true
+				continue
+			} else {
+				// The connection was swapped and firstWriteBuffer was already replayed
+				// by the swapping thread. Return len(b), nil directly to prevent writing b twice.
+				return len(b), nil
 			}
 		}
-		return
+		return 0, err
 	}
-	c.requestWritten = true
-	return len(b), nil
+}
+
+func (c *clientConn) Close() error {
+	c.connMu.Lock()
+	c.closed = true
+	conn := c.conn
+	c.connMu.Unlock()
+
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
 }
 
 func (c *clientConn) LocalAddr() net.Addr {
-	return c.Conn.LocalAddr()
+	return c.getConn().LocalAddr()
 }
 
 func (c *clientConn) RemoteAddr() net.Addr {
@@ -136,10 +287,14 @@ func (c *clientConn) RemoteAddr() net.Addr {
 }
 
 func (c *clientConn) ReaderReplaceable() bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	return c.responseRead
 }
 
 func (c *clientConn) WriterReplaceable() bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	return c.requestWritten
 }
 
@@ -147,9 +302,20 @@ func (c *clientConn) NeedAdditionalReadDeadline() bool {
 	return true
 }
 
+func (c *clientConn) SetDeadline(t time.Time) error {
+	return c.getConn().SetDeadline(t)
+}
+
+func (c *clientConn) SetReadDeadline(t time.Time) error {
+	return c.getConn().SetReadDeadline(t)
+}
+
+func (c *clientConn) SetWriteDeadline(t time.Time) error {
+	return c.getConn().SetWriteDeadline(t)
+}
 
 func (c *clientConn) SyscallConn() (syscall.RawConn, error) {
-	if sc, ok := c.Conn.(syscall.Conn); ok {
+	if sc, ok := c.getConn().(syscall.Conn); ok {
 		return sc.SyscallConn()
 	}
 	return nil, syscall.ENOTSUP

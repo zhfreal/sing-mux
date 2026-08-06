@@ -88,7 +88,7 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 			return nil, err
 		}
 		return &clientConn{
-			Conn:        stream,
+			conn:        stream,
 			destination: destination,
 			client:      c,
 			ctx:         ctx,
@@ -223,7 +223,7 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 	if err != nil {
 		return err
 	}
-	conn := &clientConn{Conn: &wrapStream{stream}, destination: M.Socksaddr{Fqdn: BrutalExchangeDomain}}
+	conn := &clientConn{conn: &wrapStream{stream}, destination: M.Socksaddr{Fqdn: BrutalExchangeDomain}}
 	err = WriteBrutalRequest(conn, c.brutal.ReceiveBPS)
 	if err != nil {
 		return err

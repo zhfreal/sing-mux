@@ -21,3 +21,7 @@ This repository contains local patches on top of version `v0.3.10` of `metacubex
    - Shortened default client `tcpTimeout` from `5 * time.Second` to `500 * time.Millisecond` to reduce the time spent waiting on dead session streams.
    - Reduced retry context timeout in `client_conn.go` from `10 * time.Second` to `1 * time.Second` to allow faster reconnection recovery on connection resets.
 
+5. **Thread-Safe Retry & Concurrency Protection (`client_conn.go`)**:
+   - Added connection locks (`connMu`), dial lock (`dialMu`), and state lock (`stateMu`) to synchronize concurrent reading and writing threads.
+   - Introduced condition variables (`requestWriteCond` and `responseReadCond`) to serialize request writes and response reads without holding locks during blocking I/O operations (preventing deadlocks).
+   - Guarded retry loop swapping using a `(swapped, ok)` state check to prevent concurrent duplicate replaying of the `firstWriteBuffer` payload.
