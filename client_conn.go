@@ -163,9 +163,19 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 					continue
 				}
 			} else {
-				// The connection was swapped and firstWriteBuffer was already replayed
-				// by the swapping thread. Return len(b), nil directly to prevent writing b twice.
-				return len(b), nil
+				// Another goroutine already swapped the connection and replayed
+				// firstWriteBuffer. Wait for its response read to finish, then
+				// delegate to the new connection. A blind `continue` would re-enter
+				// readResponse() on a connection that may still be mid-handshake,
+				// risking an infinite loop or protocol desync.
+				c.stateMu.Lock()
+				for !c.responseRead && c.responseReading {
+					c.responseReadCond.Wait()
+				}
+				c.stateMu.Unlock()
+				if c.responseRead {
+					return c.getConn().Read(b)
+				}
 			}
 		}
 		return 0, err
