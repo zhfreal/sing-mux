@@ -127,16 +127,22 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 			}
 			return nil
 		}
-		s.logger.InfoContext(ctx, "inbound multiplex connection to ", metadata.Destination)
+		if s.logger != nil {
+			s.logger.InfoContext(ctx, "inbound multiplex connection to ", metadata.Destination)
+		}
 		s.handler.NewConnection(ctx, conn, metadata)
 		stream.Close()
 	} else {
 		var packetConn N.PacketConn
 		if !request.PacketAddr {
-			s.logger.InfoContext(ctx, "inbound multiplex packet connection to ", metadata.Destination)
+			if s.logger != nil {
+				s.logger.InfoContext(ctx, "inbound multiplex packet connection to ", metadata.Destination)
+			}
 			packetConn = &serverPacketConn{ExtendedConn: bufio.NewExtendedConn(stream), destination: request.Destination}
 		} else {
-			s.logger.InfoContext(ctx, "inbound multiplex packet connection")
+			if s.logger != nil {
+				s.logger.InfoContext(ctx, "inbound multiplex packet connection")
+			}
 			packetConn = &serverPacketAddrConn{ExtendedConn: bufio.NewExtendedConn(stream)}
 		}
 		s.handler.NewPacketConnection(ctx, packetConn, metadata)

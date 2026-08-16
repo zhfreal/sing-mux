@@ -25,3 +25,9 @@ This repository contains local patches on top of version `v0.3.10` of `metacubex
    - Added connection locks (`connMu`), dial lock (`dialMu`), and state lock (`stateMu`) to synchronize concurrent reading and writing threads.
    - Introduced condition variables (`requestWriteCond` and `responseReadCond`) to serialize request writes and response reads without holding locks during blocking I/O operations (preventing deadlocks).
    - Guarded retry loop swapping using a `(swapped, ok)` state check to prevent concurrent duplicate replaying of the `firstWriteBuffer` payload.
+
+6. **Reader Serialization, Channel Safety & Nil Guards (August 2026 Audit)**:
+   - **Reader Serialization on Conn Swap (`client_conn.go`)**: Added `retrying bool` flag and `retryCond *sync.Cond` to serialize readers and writers during connection swap and replay. Reader goroutines in `Read()` wait on `retryCond` so they do not attempt to read from a newly swapped connection before the swapper has finished replaying the request header and payload. Broadcast and flag reset are guaranteed across all error and success paths.
+   - **`firstWriteBuffer` Accumulation**: Preserved write accumulation for all pre-response writes to guarantee complete replay upon reconnection.
+   - **Atomic `Close()`, Channel Send Protection & Safe Type Assertion in `h2mux` (`h2mux.go`)**: Wrapped `close(s.done)` in `s.closeOnce.Do` to prevent `"close of closed channel"` panics on concurrent session closure. Wrapped `s.inbound <- conn` in `ServeHTTP` with a `select` listening on `s.done` and `request.Context().Done()`, eliminating goroutine hangs on unbuffered channel sends. Changed bare `writer.(http.Flusher)` type assertion to comma-ok pattern to prevent panics if the `ResponseWriter` does not implement `http.Flusher`.
+   - **Nil Logger Guards (`client.go` & `server.go`)**: Protected all `logger.Debug` / `logger.InfoContext` calls against nil pointer dereferences.

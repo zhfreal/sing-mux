@@ -28,9 +28,11 @@ type clientConn struct {
 	requestWriting   bool
 	responseReadCond *sync.Cond
 	responseReading  bool
-	destination    M.Socksaddr
-	requestWritten bool
-	responseRead   bool
+	retryCond        *sync.Cond
+	retrying         bool
+	destination      M.Socksaddr
+	requestWritten   bool
+	responseRead     bool
 
 	client           *Client
 	ctx              context.Context
@@ -50,6 +52,7 @@ func (c *clientConn) lazyInit() {
 	if c.requestWriteCond == nil {
 		c.requestWriteCond = sync.NewCond(&c.stateMu)
 		c.responseReadCond = sync.NewCond(&c.stateMu)
+		c.retryCond = sync.NewCond(&c.stateMu)
 	}
 }
 
@@ -95,6 +98,7 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 	}
 	c.retryCount++
 	c.requestWritten = false
+	c.retrying = true
 	client := c.client
 	c.stateMu.Unlock()
 
@@ -102,6 +106,10 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 	defer cancel()
 	newStream, err := client.openStream(ctx)
 	if err != nil {
+		c.stateMu.Lock()
+		c.retrying = false
+		c.retryCond.Broadcast()
+		c.stateMu.Unlock()
 		return false, false
 	}
 
@@ -109,6 +117,10 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 	if c.closed {
 		c.connMu.Unlock()
 		newStream.Close()
+		c.stateMu.Lock()
+		c.retrying = false
+		c.retryCond.Broadcast()
+		c.stateMu.Unlock()
 		return false, false
 	}
 	c.conn.Close()
@@ -121,6 +133,9 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 	c.lazyInit()
 	for {
 		c.stateMu.Lock()
+		for c.retrying {
+			c.retryCond.Wait()
+		}
 		for !c.responseRead && c.responseReading {
 			c.responseReadCond.Wait()
 		}
@@ -159,6 +174,10 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 				c.stateMu.Unlock()
 
 				_, writeErr := c.write(writeBuf, true)
+				c.stateMu.Lock()
+				c.retrying = false
+				c.retryCond.Broadcast()
+				c.stateMu.Unlock()
 				if writeErr == nil {
 					continue
 				}
@@ -169,6 +188,9 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 				// readResponse() on a connection that may still be mid-handshake,
 				// risking an infinite loop or protocol desync.
 				c.stateMu.Lock()
+				for c.retrying {
+					c.retryCond.Wait()
+				}
 				for !c.responseRead && c.responseReading {
 					c.responseReadCond.Wait()
 				}
@@ -201,6 +223,9 @@ func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 	writeBuf := b
 	for {
 		c.stateMu.Lock()
+		for c.retrying && !isReplay {
+			c.retryCond.Wait()
+		}
 		for !c.requestWritten && c.requestWriting {
 			c.requestWriteCond.Wait()
 		}
@@ -241,6 +266,10 @@ func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 			c.stateMu.Lock()
 			c.requestWriting = false
 			c.requestWriteCond.Broadcast()
+			if isReplay {
+				c.retrying = false
+				c.retryCond.Broadcast()
+			}
 			c.stateMu.Unlock()
 			return 0, err
 		}
@@ -253,8 +282,16 @@ func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 		c.requestWriteCond.Broadcast()
 		if err == nil {
 			c.requestWritten = true
+			if isReplay {
+				c.retrying = false
+				c.retryCond.Broadcast()
+			}
 			c.stateMu.Unlock()
 			return len(b), nil
+		}
+		if isReplay {
+			c.retrying = false
+			c.retryCond.Broadcast()
 		}
 		c.stateMu.Unlock()
 

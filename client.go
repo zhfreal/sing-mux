@@ -239,7 +239,9 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 	}
 	clientBrutalErr := SetBrutalOptions(sessionConn, sendBPS)
 	if clientBrutalErr != nil {
-		c.logger.Debug(E.Cause(clientBrutalErr, "failed to enable TCP Brutal at client"))
+		if c.logger != nil {
+			c.logger.Debug(E.Cause(clientBrutalErr, "failed to enable TCP Brutal at client"))
+		}
 	}
 	return nil
 }
