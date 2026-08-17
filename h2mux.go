@@ -219,11 +219,13 @@ func (s *h2MuxClientSession) Open(tcpTimeout time.Duration) (net.Conn, error) {
 	request = request.WithContext(connCtx)
 	conn := newLateHTTPConn(pipeInWriter, cancel)
 	requestDone := make(chan struct{})
+	timer := time.NewTimer(tcpTimeout)
 	go func() {
 		select {
 		case <-requestDone:
+			timer.Stop()
 			return
-		case <-time.After(tcpTimeout):
+		case <-timer.C:
 			cancel()
 		}
 	}()

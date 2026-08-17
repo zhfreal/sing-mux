@@ -31,3 +31,8 @@ This repository contains local patches on top of version `v0.3.10` of `metacubex
    - **`firstWriteBuffer` Accumulation**: Preserved write accumulation for all pre-response writes to guarantee complete replay upon reconnection.
    - **Atomic `Close()`, Channel Send Protection & Safe Type Assertion in `h2mux` (`h2mux.go`)**: Wrapped `close(s.done)` in `s.closeOnce.Do` to prevent `"close of closed channel"` panics on concurrent session closure. Wrapped `s.inbound <- conn` in `ServeHTTP` with a `select` listening on `s.done` and `request.Context().Done()`, eliminating goroutine hangs on unbuffered channel sends. Changed bare `writer.(http.Flusher)` type assertion to comma-ok pattern to prevent panics if the `ResponseWriter` does not implement `http.Flusher`.
    - **Nil Logger Guards (`client.go` & `server.go`)**: Protected all `logger.Debug` / `logger.InfoContext` calls against nil pointer dereferences.
+
+7. **Stream Synchronization & Timer Leak Fixes (August 2026 Audit - Part 2)**:
+   - **`io.ErrShortBuffer` Stream Drain Fix (`client_conn.go`)**: In `clientPacketConn.Read`, `clientPacketConn.ReadFrom`, and `clientPacketAddrConn.ReadFrom`, unread packet payload bytes are drained (`io.CopyN(io.Discard, c.conn, int64(length))`) before returning `io.ErrShortBuffer`. This prevents trailing packet bytes from corrupting the length headers of subsequent frames on the stream transport.
+   - **Timer Leak Elimination in `h2mux` (`h2mux.go`)**: Replaced `time.After(tcpTimeout)` with `time.NewTimer` and explicit `timer.Stop()` upon request completion in `h2MuxClientSession.Open`, preventing goroutine timer accumulation on short-lived multiplexed streams.
+
