@@ -114,6 +114,17 @@ func (c *serverPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksad
 func (c *serverPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	c.access.Lock()
 	defer c.access.Unlock()
+	needed := 2
+	if !c.responseWritten {
+		needed += 1
+	}
+	if buffer.Start() < needed {
+		newBuf := buf.NewSize(buffer.Len() + needed)
+		newBuf.Resize(needed, 0)
+		common.Must1(newBuf.Write(buffer.Bytes()))
+		buffer.Release()
+		buffer = newBuf
+	}
 	pLen := buffer.Len()
 	common.Must(binary.Write(buf.With(buffer.ExtendHeader(2)), binary.BigEndian, uint16(pLen)))
 	if !c.responseWritten {
@@ -252,9 +263,21 @@ func (c *serverPacketAddrConn) ReadPacket(buffer *buf.Buffer) (destination M.Soc
 func (c *serverPacketAddrConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	c.access.Lock()
 	defer c.access.Unlock()
+	addrPortLen := M.SocksaddrSerializer.AddrPortLen(destination)
+	needed := 2 + addrPortLen
+	if !c.responseWritten {
+		needed += 1
+	}
+	if buffer.Start() < needed {
+		newBuf := buf.NewSize(buffer.Len() + needed)
+		newBuf.Resize(needed, 0)
+		common.Must1(newBuf.Write(buffer.Bytes()))
+		buffer.Release()
+		buffer = newBuf
+	}
 	pLen := buffer.Len()
 	common.Must(binary.Write(buf.With(buffer.ExtendHeader(2)), binary.BigEndian, uint16(pLen)))
-	err := M.SocksaddrSerializer.WriteAddrPort(buf.With(buffer.ExtendHeader(M.SocksaddrSerializer.AddrPortLen(destination))), destination)
+	err := M.SocksaddrSerializer.WriteAddrPort(buf.With(buffer.ExtendHeader(addrPortLen)), destination)
 	if err != nil {
 		return err
 	}
