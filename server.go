@@ -84,7 +84,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.M
 }
 
 func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, stream net.Conn, metadata M.Metadata) error {
-	stream = &wrapStream{stream}
+	stream = &wrapStream{Conn: stream}
 	request, err := ReadStreamRequest(stream)
 	if err != nil {
 		return E.Cause(err, "read multiplex stream request")
