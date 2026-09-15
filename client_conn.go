@@ -368,6 +368,14 @@ func (c *clientConn) SyscallConn() (syscall.RawConn, error) {
 	return nil, syscall.ENOTSUP
 }
 
+type clientConnWithCloseWrite struct {
+	*clientConn
+}
+
+func (c *clientConnWithCloseWrite) CloseWrite() error {
+	return N.CloseWrite(c.getConn())
+}
+
 var _ N.NetPacketConn = (*clientPacketConn)(nil)
 
 type clientPacketConn struct {

@@ -97,12 +97,16 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 		if err != nil {
 			return nil, err
 		}
-		return &clientConn{
+		conn := &clientConn{
 			conn:        stream,
 			destination: destination,
 			client:      c,
 			ctx:         ctx,
-		}, nil
+		}
+		if c.protocol == ProtocolH2Mux || c.protocol == ProtocolYAMux {
+			return &clientConnWithCloseWrite{clientConn: conn}, nil
+		}
+		return conn, nil
 	case N.NetworkUDP:
 		stream, err := c.openStream(ctx)
 		if err != nil {

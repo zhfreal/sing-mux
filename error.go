@@ -38,8 +38,27 @@ func (w *wrapStream) Close() error {
 	return err
 }
 
+func (w *wrapStream) CloseWrite() error {
+	if c, ok := w.Conn.(interface{ CloseWrite() error }); ok {
+		return c.CloseWrite()
+	}
+	return nil
+}
+
 func (w *wrapStream) Upstream() any {
 	return w.Conn
+}
+
+type wrapStreamCloseWrite struct {
+	*wrapStream
+}
+
+func newWrapStreamCloseWrite(conn net.Conn) *wrapStreamCloseWrite {
+	return &wrapStreamCloseWrite{wrapStream: &wrapStream{Conn: conn}}
+}
+
+func (w *wrapStreamCloseWrite) CloseWrite() error {
+	return w.wrapStream.CloseWrite()
 }
 
 func wrapError(err error) error {
