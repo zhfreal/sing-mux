@@ -87,3 +87,26 @@ func TestServerPacketAddrConnZeroHeadroom(t *testing.T) {
 		t.Fatalf("expected statusSuccess 0, got %d", written[0])
 	}
 }
+
+func TestH2MuxConnWrapperNilFlusher(t *testing.T) {
+	out := &bytes.Buffer{}
+	extPipe := &mockExtendedPipe{writeBuf: out}
+	extConn := bufio.NewExtendedConn(extPipe)
+
+	wrapper := newHTTP2Wrapper(extConn, nil)
+	n, err := wrapper.Write([]byte("test-data"))
+	if err != nil || n != 9 {
+		t.Fatalf("Write failed: n=%d, err=%v", n, err)
+	}
+
+	b := buf.New()
+	_, _ = b.WriteString("buffer-data")
+	err = wrapper.WriteBuffer(b)
+	if err != nil {
+		t.Fatalf("WriteBuffer failed: %v", err)
+	}
+
+	if !bytes.Equal(out.Bytes(), []byte("test-databuffer-data")) {
+		t.Fatalf("unexpected output: %q", out.Bytes())
+	}
+}

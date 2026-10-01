@@ -70,7 +70,7 @@ In `metacubex/sing-mux`, packet connection writing methods (`WritePacket` and `W
 - **H2Mux Channel & Close Safety**:
   - Wrapped `close(s.done)` in `sync.Once` (`s.closeOnce.Do`) to prevent `"close of closed channel"` panics during concurrent session teardown.
   - Wrapped inbound stream dispatch in `ServeHTTP` with a `select` listening on `s.done` and `request.Context().Done()`, eliminating goroutine leaks on unbuffered channel sends when a session is terminating.
-  - Converted bare `writer.(http.Flusher)` type assertion to a safe comma-ok check.
+  - Converted bare `writer.(http.Flusher)` type assertion to a safe comma-ok check, and guarded `w.flusher.Flush()` against nil in `Write` and `WriteBuffer` to prevent nil pointer dereferences on non-flusher writers.
 - **Timer Leak Elimination**: Replaced `time.After(tcpTimeout)` with `time.NewTimer` and explicit `timer.Stop()` upon request completion in `h2MuxClientSession.Open`, preventing timer accumulation on short-lived streams.
 - **Nil Logger Guards**: Protected all `logger.Debug`, `logger.InfoContext`, and `logger.ErrorContext` calls (notably in `server.go` handle connection error path) against nil pointer dereferences.
 
@@ -91,5 +91,6 @@ Comprehensive unit test coverage is implemented across:
   - `TestClient_SessionRetirementRollover`: Tests seamless rollover from retired sessions to new sessions.
 - **`server_conn_test.go`**:
   - `TestServerPacketConnZeroHeadroom` & `TestServerPacketAddrConnZeroHeadroom`: Verifies server packet zero-headroom reallocation fallback.
+  - `TestH2MuxConnWrapperNilFlusher`: Verifies `h2MuxConnWrapper` performs `Write` and `WriteBuffer` safely without panic when the flusher is nil.
 - **`yamux_halfclose_test.go`**:
   - `TestYamuxWrapStreamCloseWriteKeepsReadOpen`: Verifies that yamux `CloseWrite` keeps the read side open and delivers peer responses intact.
