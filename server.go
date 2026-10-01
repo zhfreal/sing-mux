@@ -72,7 +72,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.M
 			streamCtx := s.newStreamContext(ctx, stream)
 			go func() {
 				hErr := s.newConnection(streamCtx, conn, stream, metadata)
-				if hErr != nil {
+				if hErr != nil && s.logger != nil {
 					s.logger.ErrorContext(streamCtx, E.Cause(hErr, "handle connection"))
 				}
 			}()
