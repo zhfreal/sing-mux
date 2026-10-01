@@ -326,7 +326,11 @@ func (c *clientConn) Close() error {
 }
 
 func (c *clientConn) LocalAddr() net.Addr {
-	return c.getConn().LocalAddr()
+	conn := c.getConn()
+	if conn != nil {
+		return conn.LocalAddr()
+	}
+	return nil
 }
 
 func (c *clientConn) RemoteAddr() net.Addr {
@@ -350,19 +354,32 @@ func (c *clientConn) NeedAdditionalReadDeadline() bool {
 }
 
 func (c *clientConn) SetDeadline(t time.Time) error {
-	return c.getConn().SetDeadline(t)
+	conn := c.getConn()
+	if conn != nil {
+		return conn.SetDeadline(t)
+	}
+	return net.ErrClosed
 }
 
 func (c *clientConn) SetReadDeadline(t time.Time) error {
-	return c.getConn().SetReadDeadline(t)
+	conn := c.getConn()
+	if conn != nil {
+		return conn.SetReadDeadline(t)
+	}
+	return net.ErrClosed
 }
 
 func (c *clientConn) SetWriteDeadline(t time.Time) error {
-	return c.getConn().SetWriteDeadline(t)
+	conn := c.getConn()
+	if conn != nil {
+		return conn.SetWriteDeadline(t)
+	}
+	return net.ErrClosed
 }
 
 func (c *clientConn) SyscallConn() (syscall.RawConn, error) {
-	if sc, ok := c.getConn().(syscall.Conn); ok {
+	conn := c.getConn()
+	if sc, ok := conn.(syscall.Conn); ok {
 		return sc.SyscallConn()
 	}
 	return nil, syscall.ENOTSUP
@@ -488,6 +505,14 @@ func (c *clientPacketConn) WriteBuffer(buffer *buf.Buffer) error {
 	if !c.requestWritten {
 		defer buffer.Release()
 		return common.Error(c.writeRequest(buffer.Bytes()))
+	}
+	needed := 2
+	if buffer.Start() < needed {
+		newBuf := buf.NewSize(buffer.Len() + needed)
+		newBuf.Resize(needed, 0)
+		common.Must1(newBuf.Write(buffer.Bytes()))
+		buffer.Release()
+		buffer = newBuf
 	}
 	bLen := buffer.Len()
 	binary.BigEndian.PutUint16(buffer.ExtendHeader(2), uint16(bLen))
@@ -693,8 +718,17 @@ func (c *clientPacketAddrConn) WritePacket(buffer *buf.Buffer, destination M.Soc
 		defer buffer.Release()
 		return common.Error(c.writeRequest(buffer.Bytes(), destination))
 	}
+	addrPortLen := M.SocksaddrSerializer.AddrPortLen(destination)
+	needed := 2 + addrPortLen
+	if buffer.Start() < needed {
+		newBuf := buf.NewSize(buffer.Len() + needed)
+		newBuf.Resize(needed, 0)
+		common.Must1(newBuf.Write(buffer.Bytes()))
+		buffer.Release()
+		buffer = newBuf
+	}
 	bLen := buffer.Len()
-	header := buf.With(buffer.ExtendHeader(M.SocksaddrSerializer.AddrPortLen(destination) + 2))
+	header := buf.With(buffer.ExtendHeader(addrPortLen + 2))
 	err := M.SocksaddrSerializer.WriteAddrPort(header, destination)
 	if err != nil {
 		return err

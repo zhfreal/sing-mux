@@ -1,11 +1,15 @@
 package mux
 
 import (
+	"bytes"
 	"context"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 
+	"github.com/metacubex/sing/common/buf"
+	"github.com/metacubex/sing/common/bufio"
 	M "github.com/metacubex/sing/common/metadata"
 	N "github.com/metacubex/sing/common/network"
 )
@@ -115,6 +119,62 @@ func TestWrapStreamCloseWrite(t *testing.T) {
 	}
 	if !mock.closeWriteCalled.Load() {
 		t.Fatalf("expected mock.CloseWrite to be called by wrapStreamCloseWrite.CloseWrite")
+	}
+}
+
+func TestClientPacketConnZeroHeadroom(t *testing.T) {
+	out := &bytes.Buffer{}
+	extPipe := &mockExtendedPipe{writeBuf: out}
+	extConn := bufio.NewExtendedConn(extPipe)
+
+	cpc := &clientPacketConn{
+		AbstractConn:   extConn,
+		conn:           extConn,
+		requestWritten: true,
+	}
+
+	payload := []byte("test-client-payload-1234")
+	zeroBuf := buf.NewSize(len(payload))
+	_, _ = zeroBuf.Write(payload)
+
+	err := cpc.WritePacket(zeroBuf, M.Socksaddr{})
+	if err != nil {
+		t.Fatalf("WritePacket failed: %v", err)
+	}
+
+	written := out.Bytes()
+	if len(written) != 2+len(payload) {
+		t.Fatalf("expected written len %d, got %d", 2+len(payload), len(written))
+	}
+}
+
+func TestClientPacketAddrConnZeroHeadroom(t *testing.T) {
+	out := &bytes.Buffer{}
+	extPipe := &mockExtendedPipe{writeBuf: out}
+	extConn := bufio.NewExtendedConn(extPipe)
+
+	cpac := &clientPacketAddrConn{
+		AbstractConn:   extConn,
+		conn:           extConn,
+		requestWritten: true,
+	}
+
+	dest := M.Socksaddr{
+		Addr: netip.MustParseAddr("1.2.3.4"),
+		Port: 8080,
+	}
+
+	payload := []byte("dns-query-bytes-48-length-padding-to-match")
+	zeroBuf := buf.NewSize(len(payload))
+	_, _ = zeroBuf.Write(payload)
+
+	err := cpac.WritePacket(zeroBuf, dest)
+	if err != nil {
+		t.Fatalf("WritePacket with zero headroom failed: %v", err)
+	}
+
+	if out.Len() == 0 {
+		t.Fatalf("expected written bytes, got 0")
 	}
 }
 
