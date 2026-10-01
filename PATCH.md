@@ -1,59 +1,95 @@
-# Patch Statement: sing-mux client retry logic
+# Patch Statement: sing-mux (v0.3.12-patch2)
 
-This branch (`main-patched`) contains local patches on top of upstream `metacubex/sing-mux` to fix stream reconnect failures during VLESS Reality ticket expiration or connection resets, and periodic session retirement.
+This document describes the functional and architectural changes introduced in branch `main-patched` of `zhfreal/sing-mux` on top of the original upstream release `metacubex/sing-mux v0.3.12`.
 
-## Summary of Patches
+---
 
-1. **Re-routing Stream Boundary (`client_conn.go`)**:
-   - Removed the `Upstream() any` method from `clientConn` wrapper.
-   - **Reason**: When Mihomo's `bufio.Copy` connection relay loops start copying data, they check if a wrapper implements `Upstream() any` and recursively unwrap it to call I/O methods (`ReadFrom` / `WriteTo`) directly on the underlying `smux` / `yamux` stream object. When a ticket validation fails and the connection retries, `clientConn` replaces the internal stream reference. However, the active copy loops are still tied directly to the old stream, resulting in subsequent read/write failures on the closed stream. Removing `Upstream()` forces the relay loops to call `Read` and `Write` on `clientConn` itself, allowing transparent swapping of the underlying stream.
+## Module 1: Connection Resilience & Transparent Stream Re-routing
 
-2. **Automatic Connection Retry & Session Reset (`client_conn.go`)**:
-   - Added `firstWriteBuffer` buffering (up to 4KB) on `clientConn` to capture initial handshake payloads (e.g., TLS Client Hello).
-   - In `Read()`, if a handshake failure (e.g. ticket expired) occurs, `Reset()` is called on the multiplexer client to close the old/stale session. A new multiplexed stream is opened, and the initial write buffer is replayed automatically.
-   - Added retry mechanisms in `Write()` as well for failed stream writes.
+### 1. Issues in Original sing-mux v0.3.12
+- **Relay Loop Stream Bypassing**: When Mihomo's `bufio.Copy` connection relay loops copy data, they inspect whether wrappers implement `Upstream() any` and recursively unwrap down to the underlying `smux` / `yamux` stream object. When an upstream proxy connection resets or a VLESS Reality session ticket expires, any reconnection swap on the wrapper is completely bypassed by the active copy loop, which continues to write to the dead underlying stream and terminates the user's connection.
+- **Premature Concurrency on Reconnection Replay**: During an automatic stream retry, multiple readers or writers can trigger duplicate replaying of the handshake payload (`firstWriteBuffer`), causing protocol frame corruption or stream desynchronization.
+- **Nil Connection Panics**: Wrapper methods on closed or uninitialized connections can panic with nil pointer dereferences if the underlying connection reference is nil.
 
-3. **Asynchronous Session Closing (`client.go`)**:
-   - Changed `Client.Reset()` to run `go session.Close()` asynchronously to ensure session closure does not block the active thread during Dial retry.
-   - Ensured failed sessions are closed cleanly if `session.Open` fails in `openStream()`.
+### 2. Implementation Details (`client_conn.go`, `client.go`)
+- **Omission of `Upstream() any`**: Deliberately omitted `Upstream() any` from `clientConn` and `clientConnWithCloseWrite`. This forces external relay loops to always route I/O calls through `clientConn.Read()` and `clientConn.Write()`, preserving wrapper control and enabling seamless underlying stream swapping.
+- **Initial Handshake Buffering & Transparent Replay**:
+  - Implemented `firstWriteBuffer` (buffering up to 4 KB) to capture pre-response client handshake payloads (e.g., TLS ClientHello).
+  - On read failure before handshake response (e.g. expired Reality ticket or server reset), `clientConn` automatically invokes `Reset()` on the client, opens a fresh multiplexed stream, and transparently replays `firstWriteBuffer`.
+- **Reader & Writer Synchronization**:
+  - Introduced `retrying bool` flag and `retryCond *sync.Cond` to serialize readers during connection swaps: reader goroutines wait until the swapper has finished replaying headers and initial payloads before attempting reads on the new connection.
+  - Synchronized state transitions via mutexes (`connMu`, `dialMu`, `stateMu`) and condition variables (`requestWriteCond`, `responseReadCond`), preventing concurrent duplicate write replay.
+- **Nil Connection Guards**:
+  - Protected `LocalAddr()`, `SetDeadline()`, `SetReadDeadline()`, `SetWriteDeadline()`, and `SyscallConn()` in `clientConn` against nil connection references, returning `net.ErrClosed` or `syscall.ENOTSUP` instead of crashing.
+  - Guarded `clientConnWithCloseWrite.CloseWrite()` to return `net.ErrClosed` when the underlying connection is nil.
+- **Timeout Tuning**:
+  - Shortened default client `tcpTimeout` from 5 s to 500 ms to accelerate discovery of stale connections.
+  - Reduced reconnection context timeout from 10 s to 1 s for prompt recovery.
+  - Made `Client.Reset()` asynchronous (`go session.Close()`) to prevent session closure from blocking active dial retries.
 
-4. **Connection Setup & Retry Optimization (`client.go` & `client_conn.go`)**:
-   - Shortened default client `tcpTimeout` from `5 * time.Second` to `500 * time.Millisecond` to reduce the time spent waiting on dead session streams.
-   - Reduced retry context timeout in `client_conn.go` from `10 * time.Second` to `1 * time.Second` to allow faster reconnection recovery on connection resets.
+---
 
-5. **Thread-Safe Retry & Concurrency Protection (`client_conn.go`)**:
-   - Added connection locks (`connMu`), dial lock (`dialMu`), and state lock (`stateMu`) to synchronize concurrent reading and writing threads.
-   - Introduced condition variables (`requestWriteCond` and `responseReadCond`) to serialize request writes and response reads without holding locks during blocking I/O operations (preventing deadlocks).
-   - Guarded retry loop swapping using a `(swapped, ok)` state check to prevent concurrent duplicate replaying of the `firstWriteBuffer` payload.
+## Module 2: XMUX-Style Periodic Session Retirement & Graceful Drain
 
-6. **Reader Serialization, Channel Safety & Nil Guards (August 2026 Audit)**:
-   - **Reader Serialization on Conn Swap (`client_conn.go`)**: Added `retrying bool` flag and `retryCond *sync.Cond` to serialize readers and writers during connection swap and replay. Reader goroutines in `Read()` wait on `retryCond` so they do not attempt to read from a newly swapped connection before the swapper has finished replaying the request header and payload. Broadcast and flag reset are guaranteed across all error and success paths.
-   - **`firstWriteBuffer` Accumulation**: Preserved write accumulation for all pre-response writes to guarantee complete replay upon reconnection.
-   - **Atomic `Close()`, Channel Send Protection & Safe Type Assertion in `h2mux` (`h2mux.go`)**: Wrapped `close(s.done)` in `s.closeOnce.Do` to prevent `"close of closed channel"` panics on concurrent session closure. Wrapped `s.inbound <- conn` in `ServeHTTP` with a `select` listening on `s.done` and `request.Context().Done()`, eliminating goroutine hangs on unbuffered channel sends. Changed bare `writer.(http.Flusher)` type assertion to comma-ok pattern to prevent panics if the `ResponseWriter` does not implement `http.Flusher`.
-   - **Nil Logger Guards (`client.go` & `server.go`)**: Protected all `logger.Debug` / `logger.InfoContext` calls against nil pointer dereferences.
+### 1. Problem
+Under persistent TCP traffic, long-lived multiplexed connections are vulnerable to stateful flow tracking, heuristic classification, and RST severance by censorship middleboxes.
 
-7. **Stream Synchronization & Timer Leak Fixes (August 2026 Audit - Part 2)**:
-   - **`io.ErrShortBuffer` Stream Drain Fix (`client_conn.go`)**: In `clientPacketConn.Read`, `clientPacketConn.ReadFrom`, and `clientPacketAddrConn.ReadFrom`, unread packet payload bytes are drained (`io.CopyN(io.Discard, c.conn, int64(length))`) before returning `io.ErrShortBuffer`. This prevents trailing packet bytes from corrupting the length headers of subsequent frames on the stream transport.
-   - **Timer Leak Elimination in `h2mux` (`h2mux.go`)**: Replaced `time.After(tcpTimeout)` with `time.NewTimer` and explicit `timer.Stop()` upon request completion in `h2MuxClientSession.Open`, preventing goroutine timer accumulation on short-lived multiplexed streams.
+### 2. Implementation Details (`client.go`, `session.go`, `error.go`)
+- **Session Wrapper & Bounds**: Implemented `sessionWrapper` wrapping `abstractSession` to track:
+  - `HMaxReusableSecs`: Hard expiration timestamp (`unreusableAt = now + HMaxReusableSecs`).
+  - `HMaxRequestTimes`: Remaining stream request capacity (`leftRequests`).
+  - `CMaxReuseTimes`: Remaining session reuse capacity (`leftReuseTimes`).
+- **Graceful Drain Lifecycle**:
+  - In `Client.offer()`, expired/retired sessions are excluded from taking new stream requests.
+  - Active in-flight streams on retired sessions continue serving traffic uninterrupted until closed (`NumStreams() == 0`).
+  - Retired sessions with 0 active streams are cleanly closed and evicted from the session list.
+- **Stream Lifecycle Tracking across Multiplexers**:
+  - Maintained `wrapStream.onClose` callback and `closeOnce` semantics across `smux`, `yamux`, and `h2mux`.
+  - Closing a stream decrements `activeStreams.Add(-1)` and triggers `maybeCloseSession()` for timely retirement eviction without resource leaks.
 
-8. **Defensive Front Headroom Fallback & Nil Connection Guards (`server_conn.go` & `client_conn.go`)**:
-   - **`ExtendHeader` Buffer Overflow Prevention**: In `serverPacketConn.WritePacket`, `serverPacketAddrConn.WritePacket`, `clientPacketConn.WriteBuffer`, and `clientPacketAddrConn.WritePacket`, the methods prepend protocol framing (`ExtendHeader(2)` for payload length, `ExtendHeader(1)` for `statusSuccess`, and `ExtendHeader(addrPortLen)` for target address). If a caller supplies a `buf.Buffer` with insufficient front headroom (`buffer.Start() < needed`), `ExtendHeader` triggers an unhandled `panic: buffer overflow: capacity ..., start 0, need 2`.
-   - **Automatic Reallocation Fallback**: Added a defensive check (`buffer.Start() < needed`) across both server and client packet implementations that automatically reallocates a buffer with the required headroom (`buf.NewSize(buffer.Len() + needed)`), resizes it to reserve the headroom, copies the payload, and releases the original buffer. This guarantees that `WritePacket` / `WriteBuffer` never crashes with a buffer overflow panic regardless of caller buffer preparation.
-   - **Nil Connection Guards in `clientConn`**: Protected `LocalAddr()`, `SetDeadline()`, `SetReadDeadline()`, `SetWriteDeadline()`, and `SyscallConn()` against nil pointer dereferences when the underlying connection reference is uninitialized or closed.
+---
 
-9. **XMUX-Style Periodic Session Retirement (`client.go` & `session.go`)**:
-   - **Censorship Middlebox Reset Protection**: Under persistent TCP traffic, long-lived multiplexed connections are susceptible to stateful tracking and RST injection by censorship systems. This patch adds XMUX-style periodic session retirement (`HMaxReusableSecs`, `HMaxRequestTimes`, `CMaxReuseTimes`).
-   - **Session Wrapper & Retirement Deadline**: Wraps active `abstractSession` instances in `sessionWrapper` which calculates `unreusableAt = now + HMaxReusableSecs` upon creation and tracks remaining stream requests (`leftRequests`) and reuses (`leftReuseTimes`).
-   - **Graceful Drain & Selective Allocation**: In `Client.offer()`, expired/retired sessions are excluded from taking new streams, while existing in-flight streams on retired sessions continue to serve traffic until they naturally finish. Once a retired session reaches 0 active streams (`NumStreams() == 0`), it is cleanly closed and evicted.
+## Module 3: Defensive Front Headroom Fallback & Buffer Safety
 
-10. **Upstream v0.3.11 Half-Close & Header Integration (`h2mux.go`, `h2mux_conn.go`, `error.go`, `client_conn.go`, `client.go`, `server.go`, `session.go`)**:
-   - **`http.Request.Header` Initialization (`h2mux.go`)**: Initialized `Header: make(http.Header)` in `h2MuxClientSession.Open` (adopting upstream commit `b602024`), fixing `"http: nil Request.Header"` panics under `golang.org/x/net >= v0.57.0` (Mihomo v1.19.31 uses `v0.58.0`).
-   - **Half-Close Support (`CloseWrite`) (`h2mux_conn.go`, `session.go`, `error.go`)**: Implemented `CloseWrite()` across `httpConn` (closing pipe writer to emit `END_STREAM`), `yamuxWrapStream` (delegating to `w.Stream.CloseWrite()` to emit `FIN` without premature read termination), and `wrapStream` (delegating to underlying connection if `CloseWrite()` is supported).
-   - **XMUX Retirement Lifecycle Protection (`error.go`, `client.go`)**: Retained `wrapStream.onClose` callback and `closeOnce` semantics across `wrapStream`. Streams opened on `yamux` or `h2mux` maintain active stream accounting (`activeStreams.Add(-1)` and `maybeCloseSession`), preventing session drain leaks.
-   - **Stream Swapping Thread Safety & Isolation (`client_conn.go`)**: Implemented `clientConnWithCloseWrite` delegating `CloseWrite()` via thread-safe `c.getConn()`. Deliberately omitted `Upstream() any` on `clientConnWithCloseWrite` to prevent external relay copy loops from bypassing wrapper state during VLESS Reality ticket swaps.
+### 1. Problem
+In `metacubex/sing-mux`, packet connection writing methods (`WritePacket` and `WriteBuffer`) prepend protocol framing headers via `buffer.ExtendHeader(...)`. If a caller supplies a `buf.Buffer` with insufficient front headroom (`buffer.Start() < needed`), `ExtendHeader` triggers an unhandled `panic: buffer overflow: capacity ..., start 0, need ...`, crashing the process.
 
-11. **Upstream v0.3.12 Yamux Half-Close & Unit Test Synchronization**:
-   - **Synchronized Upstream v0.3.12**: Merged upstream `v0.3.12` into `main-patched`, aligning with upstream mihomo v1.19.32's `sing-mux` requirement.
-   - **Yamux Half-Close Verification**: Verified that `w.Stream.CloseWrite()` in `yamuxWrapStream` properly half-closes yamux streams without closing the read side, preserving peer response delivery.
-   - **Adopted `yamux_halfclose_test.go`**: Integrated upstream's half-close regression test `TestYamuxWrapStreamCloseWriteKeepsReadOpen`, verifying that peer response bytes are received intact after client half-close.
-   - **Preserved Concurrency Safety**: Ensured that `clientConnWithCloseWrite` delegates `CloseWrite()` via thread-safe `c.getConn()` without exposing `Upstream() any`.
+### 2. Implementation Details (`server_conn.go`, `client_conn.go`)
+- **Automatic Headroom Reallocation Fallback**:
+  - Applied to `serverPacketConn.WritePacket`, `serverPacketAddrConn.WritePacket`, `clientPacketConn.WriteBuffer`, and `clientPacketAddrConn.WritePacket`.
+  - Checks if `buffer.Start() < needed`. If headroom is insufficient, transparently reallocates a buffer with the required headroom (`buf.NewSize(buffer.Len() + needed)`), copies the payload, and safely releases the original buffer.
+- **Short Buffer Stream Drain Fix**:
+  - In `clientPacketConn.Read`, `clientPacketConn.ReadFrom`, and `clientPacketAddrConn.ReadFrom`, unread packet payload bytes are drained (`io.CopyN(io.Discard, c.conn, int64(length))`) before returning `io.ErrShortBuffer`.
+  - Prevents leftover payload bytes from corrupting length headers of subsequent frames on the multiplexed stream.
+
+---
+
+## Module 4: Protocol Engine Safety & Resource Leak Hardening
+
+### 1. Implementation Details (`h2mux.go`, `server.go`, `client.go`)
+- **H2Mux Channel & Close Safety**:
+  - Wrapped `close(s.done)` in `sync.Once` (`s.closeOnce.Do`) to prevent `"close of closed channel"` panics during concurrent session teardown.
+  - Wrapped inbound stream dispatch in `ServeHTTP` with a `select` listening on `s.done` and `request.Context().Done()`, eliminating goroutine leaks on unbuffered channel sends when a session is terminating.
+  - Converted bare `writer.(http.Flusher)` type assertion to a safe comma-ok check.
+- **Timer Leak Elimination**: Replaced `time.After(tcpTimeout)` with `time.NewTimer` and explicit `timer.Stop()` upon request completion in `h2MuxClientSession.Open`, preventing timer accumulation on short-lived streams.
+- **Nil Logger Guards**: Protected all `logger.Debug`, `logger.InfoContext`, and `logger.ErrorContext` calls (notably in `server.go` handle connection error path) against nil pointer dereferences.
+
+---
+
+## Module 5: Test Suite & Regression Verification
+
+Comprehensive unit test coverage is implemented across:
+- **`client_conn_test.go`**:
+  - `TestClientConnWithCloseWrite`: Validates `N.WriteCloser` implementation, verifies exclusion of `Upstream() any`, and tests half-close vs full close lifecycle.
+  - `TestWrapStreamCloseWrite`: Verifies half-close propagation across stream wrappers.
+  - `TestClientPacketConnZeroHeadroom`: Tests automatic front headroom reallocation fallback on `clientPacketConn`.
+  - `TestClientPacketAddrConnZeroHeadroom`: Tests automatic front headroom reallocation fallback on `clientPacketAddrConn`.
+- **`client_test.go`**:
+  - `TestParseRange`: Validates parsing of range strings (e.g. `"10-20"`, `"30"`, `"0"`).
+  - `TestSessionWrapperRetirement`: Verifies retirement evaluation against requests, reuses, and time limits.
+  - `TestWrapStreamCloseCallback`: Verifies stream close callback invocation.
+  - `TestClient_SessionRetirementRollover`: Tests seamless rollover from retired sessions to new sessions.
+- **`server_conn_test.go`**:
+  - `TestServerPacketConnZeroHeadroom` & `TestServerPacketAddrConnZeroHeadroom`: Verifies server packet zero-headroom reallocation fallback.
+- **`yamux_halfclose_test.go`**:
+  - `TestYamuxWrapStreamCloseWriteKeepsReadOpen`: Verifies that yamux `CloseWrite` keeps the read side open and delivers peer responses intact.
