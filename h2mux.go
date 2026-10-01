@@ -137,7 +137,7 @@ func (w *h2MuxConnWrapper) Write(p []byte) (n int, err error) {
 		return 0, net.ErrClosed
 	}
 	n, err = w.ExtendedConn.Write(p)
-	if err == nil {
+	if err == nil && w.flusher != nil {
 		w.flusher.Flush()
 	}
 	return
@@ -150,7 +150,7 @@ func (w *h2MuxConnWrapper) WriteBuffer(buffer *buf.Buffer) error {
 		return net.ErrClosed
 	}
 	err := w.ExtendedConn.WriteBuffer(buffer)
-	if err == nil {
+	if err == nil && w.flusher != nil {
 		w.flusher.Flush()
 	}
 	return err
