@@ -103,6 +103,10 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 			client:      c,
 			ctx:         ctx,
 		}
+		// h2mux and yamux support half-close; expose CloseWrite so callers
+		// send END_STREAM / FIN instead of falling back to a full close
+		// (which is RST_STREAM on h2mux and drops in-flight data). smux v1
+		// has no half-close, so its stream is deliberately left without one.
 		if c.protocol == ProtocolH2Mux || c.protocol == ProtocolYAMux {
 			return &clientConnWithCloseWrite{clientConn: conn}, nil
 		}

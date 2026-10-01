@@ -1,6 +1,6 @@
 # Patch Statement: sing-mux client retry logic
 
-This repository contains local patches on top of version `v0.3.10` of `metacubex/sing-mux` to fix stream reconnect failures during VLESS Reality ticket expiration or connection resets.
+This branch (`main-patched`) contains local patches on top of upstream `metacubex/sing-mux` to fix stream reconnect failures during VLESS Reality ticket expiration or connection resets, and periodic session retirement.
 
 ## Summary of Patches
 
@@ -50,3 +50,9 @@ This repository contains local patches on top of version `v0.3.10` of `metacubex
    - **Half-Close Support (`CloseWrite`) (`h2mux_conn.go`, `session.go`, `error.go`)**: Implemented `CloseWrite()` across `httpConn` (closing pipe writer to emit `END_STREAM`), `yamuxWrapStream` (delegating to `w.Stream.CloseWrite()` to emit `FIN` without premature read termination), and `wrapStream` (delegating to underlying connection if `CloseWrite()` is supported).
    - **XMUX Retirement Lifecycle Protection (`error.go`, `client.go`)**: Retained `wrapStream.onClose` callback and `closeOnce` semantics across `wrapStream`. Streams opened on `yamux` or `h2mux` maintain active stream accounting (`activeStreams.Add(-1)` and `maybeCloseSession`), preventing session drain leaks.
    - **Stream Swapping Thread Safety & Isolation (`client_conn.go`)**: Implemented `clientConnWithCloseWrite` delegating `CloseWrite()` via thread-safe `c.getConn()`. Deliberately omitted `Upstream() any` on `clientConnWithCloseWrite` to prevent external relay copy loops from bypassing wrapper state during VLESS Reality ticket swaps.
+
+11. **Upstream v0.3.12 Yamux Half-Close & Unit Test Synchronization**:
+   - **Synchronized Upstream v0.3.12**: Merged upstream `v0.3.12` into `main-patched`, aligning with upstream mihomo v1.19.32's `sing-mux` requirement.
+   - **Yamux Half-Close Verification**: Verified that `w.Stream.CloseWrite()` in `yamuxWrapStream` properly half-closes yamux streams without closing the read side, preserving peer response delivery.
+   - **Adopted `yamux_halfclose_test.go`**: Integrated upstream's half-close regression test `TestYamuxWrapStreamCloseWriteKeepsReadOpen`, verifying that peer response bytes are received intact after client half-close.
+   - **Preserved Concurrency Safety**: Ensured that `clientConnWithCloseWrite` delegates `CloseWrite()` via thread-safe `c.getConn()` without exposing `Upstream() any`.

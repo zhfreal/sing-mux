@@ -58,7 +58,10 @@ func newWrapStreamCloseWrite(conn net.Conn) *wrapStreamCloseWrite {
 }
 
 func (w *wrapStreamCloseWrite) CloseWrite() error {
-	return w.wrapStream.CloseWrite()
+	if c, ok := w.Conn.(interface{ CloseWrite() error }); ok {
+		return c.CloseWrite()
+	}
+	return nil
 }
 
 func wrapError(err error) error {
