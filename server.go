@@ -99,34 +99,74 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 		conn := &serverConn{ExtendedConn: bufio.NewExtendedConn(stream)}
 		if request.Destination.Fqdn == BrutalExchangeDomain {
 			defer stream.Close()
-			var clientReceiveBPS uint64
-			clientReceiveBPS, err = ReadBrutalRequest(conn)
+			isV2 := request.Destination.Port == BrutalExchangePortV2
+			req, err := ReadBrutalRequest(conn)
 			if err != nil {
 				return E.Cause(err, "read brutal request")
 			}
 			if !s.brutal.Enabled {
-				err = WriteBrutalResponse(conn, 0, false, "brutal is not enabled by the server")
+				err = WriteBrutalResponse(conn, BrutalExchangeResponse{}, false, "brutal is not enabled by the server")
 				if err != nil {
 					return E.Cause(err, "write brutal response")
 				}
 				return nil
 			}
+			clientReceiveBPS := req.ReceiveBPS
 			sendBPS := s.brutal.SendBPS
 			if clientReceiveBPS < sendBPS {
 				sendBPS = clientReceiveBPS
 			}
-			err = SetBrutalOptions(sessionConn, sendBPS)
+			var groupID uint64
+			if s.brutal.GroupID > 0 {
+				groupID = s.brutal.GroupID
+			} else if s.brutal.AllowClientGroupID && isV2 {
+				userTenant := ""
+				if metadata.Source.Addr.IsValid() {
+					userTenant = metadata.Source.Addr.String()
+				} else if metadata.Source.Fqdn != "" {
+					userTenant = metadata.Source.Fqdn
+				}
+				if userTenant == "" && sessionConn != nil && sessionConn.RemoteAddr() != nil {
+					if host, _, err := net.SplitHostPort(sessionConn.RemoteAddr().String()); err == nil {
+						userTenant = host
+					} else {
+						userTenant = sessionConn.RemoteAddr().String()
+					}
+				}
+				if userTenant != "" || req.GroupID > 0 {
+					groupID = deriveTenantGroupID(userTenant, req.GroupID)
+				}
+			}
+			gain := uint32(req.CwndGain)
+			if gain == 0 {
+				gain = 20
+			}
+			err = SetBrutalOptions(sessionConn, sendBPS, groupID, gain)
 			if err != nil {
 				// ignore error in test
 				if !debug.Enabled {
-					err = WriteBrutalResponse(conn, 0, false, E.Cause(err, "enable TCP Brutal").Error())
+					err = WriteBrutalResponse(conn, BrutalExchangeResponse{}, false, E.Cause(err, "enable TCP Brutal").Error())
 					if err != nil {
 						return E.Cause(err, "write brutal response")
 					}
 					return nil
 				}
+				if s.logger != nil {
+					s.logger.ErrorContext(ctx, E.Cause(err, "failed to enable TCP Brutal on server socket"))
+				}
+			} else if s.logger != nil {
+				if isV2 {
+					s.logger.DebugContext(ctx, "inbound brutal v2 negotiated: sendBPS=", sendBPS, " groupID=", groupID, " gain=", gain)
+				} else {
+					s.logger.DebugContext(ctx, "inbound brutal v1 negotiated: sendBPS=", sendBPS)
+				}
 			}
-			err = WriteBrutalResponse(conn, s.brutal.ReceiveBPS, true, "")
+			err = WriteBrutalResponse(conn, BrutalExchangeResponse{
+				ReceiveBPS: s.brutal.ReceiveBPS,
+				GroupID:    groupID,
+				CwndGain:   gain,
+				IsV2:       isV2,
+			}, true, "")
 			if err != nil {
 				return E.Cause(err, "write brutal response")
 			}

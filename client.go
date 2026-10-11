@@ -49,9 +49,13 @@ type Options struct {
 }
 
 type BrutalOptions struct {
-	Enabled    bool
-	SendBPS    uint64
-	ReceiveBPS uint64
+	Enabled            bool
+	SendBPS            uint64
+	ReceiveBPS         uint64
+	Version            uint16
+	CwndGain           uint32
+	GroupID            uint64
+	AllowClientGroupID bool
 }
 
 func NewClient(options Options) (*Client, error) {
@@ -313,24 +317,50 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 	if err != nil {
 		return err
 	}
-	conn := &clientConn{conn: &wrapStream{Conn: stream}, destination: M.Socksaddr{Fqdn: BrutalExchangeDomain}}
-	err = WriteBrutalRequest(conn, c.brutal.ReceiveBPS)
+	wantV2 := c.brutal.Version == 2 || (c.brutal.Version == 0 && c.brutal.GroupID > 0)
+	port := uint16(0)
+	if wantV2 {
+		port = BrutalExchangePortV2
+	}
+	conn := &clientConn{conn: &wrapStream{Conn: stream}, destination: M.Socksaddr{Fqdn: BrutalExchangeDomain, Port: port}}
+	defer conn.Close()
+	gain := c.brutal.CwndGain
+	if gain == 0 {
+		gain = 20
+	}
+	req := BrutalExchangeRequest{
+		ReceiveBPS: c.brutal.ReceiveBPS,
+		CwndGain:   uint16(gain),
+		GroupID:    c.brutal.GroupID,
+	}
+	err = WriteBrutalRequest(conn, req)
 	if err != nil {
 		return err
 	}
-	serverReceiveBPS, err := ReadBrutalResponse(conn)
+	resp, isV2, err := ReadBrutalResponse(conn, wantV2)
 	if err != nil {
 		return err
 	}
-	conn.Close()
 	sendBPS := c.brutal.SendBPS
-	if serverReceiveBPS < sendBPS {
-		sendBPS = serverReceiveBPS
+	if resp.ReceiveBPS < sendBPS {
+		sendBPS = resp.ReceiveBPS
 	}
-	clientBrutalErr := SetBrutalOptions(sessionConn, sendBPS)
+	var groupID uint64
+	if isV2 {
+		groupID = resp.GroupID
+	}
+	clientBrutalErr := SetBrutalOptions(sessionConn, sendBPS, groupID, uint32(resp.CwndGain))
 	if clientBrutalErr != nil {
 		if c.logger != nil {
-			c.logger.Debug(E.Cause(clientBrutalErr, "failed to enable TCP Brutal at client"))
+			c.logger.Error(E.Cause(clientBrutalErr, "failed to enable TCP Brutal on client socket"))
+		}
+	} else if c.logger != nil {
+		if isV2 {
+			c.logger.Debug("brutal v2 negotiated: sendBPS=", sendBPS, " groupID=", groupID, " cwndGain=", resp.CwndGain)
+		} else if wantV2 {
+			c.logger.Debug("server does not support brutal v2, cleanly degraded to brutal v1: sendBPS=", sendBPS)
+		} else {
+			c.logger.Debug("brutal v1 negotiated: sendBPS=", sendBPS)
 		}
 	}
 	return nil

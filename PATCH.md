@@ -1,4 +1,4 @@
-# Patch Statement: sing-mux (v0.3.12-patch2)
+# Patch Statement: sing-mux (v0.3.12-patch3)
 
 This document describes the functional and architectural changes introduced in branch `main-patched` of `zhfreal/sing-mux` on top of the original upstream release `metacubex/sing-mux v0.3.12`.
 
@@ -94,3 +94,34 @@ Comprehensive unit test coverage is implemented across:
   - `TestH2MuxConnWrapperNilFlusher`: Verifies `h2MuxConnWrapper` performs `Write` and `WriteBuffer` safely without panic when the flusher is nil.
 - **`yamux_halfclose_test.go`**:
   - `TestYamuxWrapStreamCloseWriteKeepsReadOpen`: Verifies that yamux `CloseWrite` keeps the read side open and delivers peer responses intact.
+- **`brutal_test.go`**:
+  - `TestBrutalParamsPacking`: Verifies native endian parameter serialization for kernel v1 (12 bytes) and v2 (20 bytes) structs.
+  - `TestBrutalRequestZeroUnreadBytes`: Verifies that Brutal client exchange requests emit strictly 8 bytes of rate data without trailing unread bytes.
+  - `TestBrutalResponseV2Roundtrip`: Tests end-to-end 25-byte v2 exchange serialization with magic, rate, group ID, and cwnd gain.
+  - `TestBrutalResponseV1CleanFallback`: Verifies seamless, error-free fallback when connecting to a legacy v1 server that closes after sending 9 bytes.
+  - `TestBrutalResponseCorruptMagic` & `TestBrutalResponseTruncatedV2`: Validates defensive stream error handling against corrupt or truncated responses.
+  - `TestDeriveTenantGroupID`: Validates tenant group ID deterministic isolation and collision resistance under FNV-1a.
+  - `TestClampedSpeedAndGain`: Validates rate and CWND gain bounds clamping against Linux kernel limits.
+
+---
+
+## Module 6: TCP Brutal v2 Protocol Negotiation & Multi-Tenant Bandwidth Management
+
+### 1. Problem
+The original upstream Brutal bandwidth exchange had structural constraints:
+- **Fixed Congestion Window & Single Parameter Negotiation**: Upstream only exchanged a raw `ReceiveBPS` rate uint64. The congestion window gain was hardcoded to `20` (2.0x), lacking adaptability for high-latency or fluctuating WAN routes.
+- **Unpooled Multi-Tenant Bandwidth Collisions**: Lacked tenant isolation and group-based bandwidth sharing across concurrent multiplexed connections. Multiple users or streams could starve each other without partitioned fair allocations.
+- **Kernel Compatibility & Fragile Privilege Constraints**: Calling `setsockopt(..., TCP_CONGESTION, "brutal")` or `TCP_BRUTAL_PARAMS` on systems with policy route locks (`brutalctl`/`congctl` locks) returned `EPERM`, aborting sessions even when TCP Brutal was already assigned to the socket. Furthermore, upstream lacked support for TCP Brutal kernel v2 data structures (`TCP_BRUTAL_VERSION`).
+
+### 2. Implementation Details (`brutal.go`, `brutal_linux.go`, `client.go`, `server.go`, `brutal_stub.go`)
+- **Brutal v2 Stream Negotiation Protocol (`brutal.go`)**:
+  - Introduced dedicated port signaling via `BrutalExchangePortV2` (port `23302`) and magic number `BrutalMagicV2` (`0x42525502`) in stream requests to declare v2 capabilities.
+  - **Zero-Unread-Byte Invariant (`WriteBrutalRequest`)**: In outbound client requests, the client transmits strictly the 8-byte `ReceiveBPS` rate payload without trailing unread bytes, relying on destination port `23302` in `StreamRequest` to declare v2 capability. This eliminates trailing byte buffers and prevents legacy v1 servers from aborting with RST.
+  - **Transparent V1 Degradation Fallback (`ReadBrutalResponse`)**: Supports reading both legacy 9-byte responses (`[1][rate]`) and 25-byte v2 extension responses (`[1][rate][magic][groupID][cwndGain]`). On legacy v1 servers that write 9 bytes and immediately close the exchange stream, clean EOF / 0-byte `ErrUnexpectedEOF` is detected and gracefully falls back to Brutal v1 without error.
+- **Multi-Tenant Group ID Isolation & CWND Tuning (`brutal.go`, `server.go`, `client.go`)**:
+  - Implemented `deriveTenantGroupID(userUUID, clientGroupID)` using 64-bit FNV-1a hashing to partition client group IDs by tenant identity with zero heap allocations, preventing noisy-neighbor starvation across multi-tenant deployments.
+  - Supported configurable `CwndGain` (bounded between `BrutalMinCwndGain` 5 [0.5x] and `BrutalMaxCwndGain` 80 [8.0x], defaulting to 20 [2.0x]).
+- **Linux Kernel v2 Integration & Privilege Safety (`brutal_linux.go`)**:
+  - Dynamically detects kernel support via `TCP_BRUTAL_VERSION` (`23302`) and formats parameter buffers via `packBrutalParamsV2` (20 bytes: `[rate][cwndGain][groupID]`) or `packBrutalParamsV1` (12 bytes: `[rate][cwndGain]`).
+  - Implemented `setsockoptRaw` using `syscall.Syscall6` to avoid runtime memory overheads.
+  - Silent `EPERM` error tolerance: If `setsockopt(..., TCP_CONGESTION, "brutal")` or `TCP_BRUTAL_PARAMS` returns `EPERM`, verifies whether the socket already has `"brutal"` assigned by system routing rules (`brutalctl`), and cleanly tolerates permission restrictions without breaking the connection.
