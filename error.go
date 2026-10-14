@@ -10,6 +10,7 @@ import (
 
 type wrapStream struct {
 	net.Conn
+	session   abstractSession
 	onClose   func()
 	closeOnce sync.Once
 }
@@ -43,6 +44,10 @@ func (w *wrapStream) CloseWrite() error {
 		return c.CloseWrite()
 	}
 	return nil
+}
+
+func (w *wrapStream) Session() abstractSession {
+	return w.session
 }
 
 func (w *wrapStream) Upstream() any {

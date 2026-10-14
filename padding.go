@@ -43,50 +43,52 @@ func newPaddingConn(conn net.Conn) net.Conn {
 }
 
 func (c *paddingConn) Read(p []byte) (n int, err error) {
-	if c.readRemaining > 0 {
-		if len(p) > c.readRemaining {
-			p = p[:c.readRemaining]
-		}
-		n, err = c.ExtendedConn.Read(p)
-		if err != nil {
+	for {
+		if c.readRemaining > 0 {
+			if len(p) > c.readRemaining {
+				p = p[:c.readRemaining]
+			}
+			n, err = c.ExtendedConn.Read(p)
+			if err != nil {
+				return
+			}
+			c.readRemaining -= n
 			return
 		}
-		c.readRemaining -= n
-		return
+		if c.paddingRemaining > 0 {
+			err = rw.SkipN(c.ExtendedConn, c.paddingRemaining)
+			if err != nil {
+				return
+			}
+			c.paddingRemaining = 0
+		}
+		if c.readPadding < kFirstPaddings {
+			var paddingHdr [4]byte
+			_, err = io.ReadFull(c.ExtendedConn, paddingHdr[:])
+			if err != nil {
+				return
+			}
+			originalDataSize := int(binary.BigEndian.Uint16(paddingHdr[:2]))
+			paddingLen := int(binary.BigEndian.Uint16(paddingHdr[2:]))
+			c.readPadding++
+			c.paddingRemaining = paddingLen
+
+			if originalDataSize == 0 {
+				continue
+			}
+
+			if len(p) > originalDataSize {
+				p = p[:originalDataSize]
+			}
+			n, err = c.ExtendedConn.Read(p)
+			if err != nil {
+				return
+			}
+			c.readRemaining = originalDataSize - n
+			return
+		}
+		return c.ExtendedConn.Read(p)
 	}
-	if c.paddingRemaining > 0 {
-		err = rw.SkipN(c.ExtendedConn, c.paddingRemaining)
-		if err != nil {
-			return
-		}
-		c.paddingRemaining = 0
-	}
-	if c.readPadding < kFirstPaddings {
-		var paddingHdr []byte
-		if len(p) >= 4 {
-			paddingHdr = p[:4]
-		} else {
-			paddingHdr = make([]byte, 4)
-		}
-		_, err = io.ReadFull(c.ExtendedConn, paddingHdr)
-		if err != nil {
-			return
-		}
-		originalDataSize := int(binary.BigEndian.Uint16(paddingHdr[:2]))
-		paddingLen := int(binary.BigEndian.Uint16(paddingHdr[2:]))
-		if len(p) > originalDataSize {
-			p = p[:originalDataSize]
-		}
-		n, err = c.ExtendedConn.Read(p)
-		if err != nil {
-			return
-		}
-		c.readPadding++
-		c.readRemaining = originalDataSize - n
-		c.paddingRemaining = paddingLen
-		return
-	}
-	return c.ExtendedConn.Read(p)
 }
 
 func (c *paddingConn) Write(p []byte) (n int, err error) {
@@ -131,54 +133,55 @@ func (c *paddingConn) write(p []byte) (n int, err error) {
 }
 
 func (c *paddingConn) ReadBuffer(buffer *buf.Buffer) error {
-	p := buffer.FreeBytes()
-	if c.readRemaining > 0 {
-		if len(p) > c.readRemaining {
-			p = p[:c.readRemaining]
+	for {
+		p := buffer.FreeBytes()
+		if c.readRemaining > 0 {
+			if len(p) > c.readRemaining {
+				p = p[:c.readRemaining]
+			}
+			n, err := c.ExtendedConn.Read(p)
+			if err != nil {
+				return err
+			}
+			c.readRemaining -= n
+			buffer.Truncate(n)
+			return nil
 		}
-		n, err := c.ExtendedConn.Read(p)
-		if err != nil {
-			return err
+		if c.paddingRemaining > 0 {
+			err := rw.SkipN(c.ExtendedConn, c.paddingRemaining)
+			if err != nil {
+				return err
+			}
+			c.paddingRemaining = 0
 		}
-		c.readRemaining -= n
-		buffer.Truncate(n)
-		return nil
-	}
-	if c.paddingRemaining > 0 {
-		err := rw.SkipN(c.ExtendedConn, c.paddingRemaining)
-		if err != nil {
-			return err
-		}
-		c.paddingRemaining = 0
-	}
-	if c.readPadding < kFirstPaddings {
-		var paddingHdr []byte
-		if len(p) >= 4 {
-			paddingHdr = p[:4]
-		} else {
-			paddingHdr = make([]byte, 4)
-		}
-		_, err := io.ReadFull(c.ExtendedConn, paddingHdr)
-		if err != nil {
-			return err
-		}
-		originalDataSize := int(binary.BigEndian.Uint16(paddingHdr[:2]))
-		paddingLen := int(binary.BigEndian.Uint16(paddingHdr[2:]))
+		if c.readPadding < kFirstPaddings {
+			var paddingHdr [4]byte
+			_, err := io.ReadFull(c.ExtendedConn, paddingHdr[:])
+			if err != nil {
+				return err
+			}
+			originalDataSize := int(binary.BigEndian.Uint16(paddingHdr[:2]))
+			paddingLen := int(binary.BigEndian.Uint16(paddingHdr[2:]))
+			c.readPadding++
+			c.paddingRemaining = paddingLen
 
-		if len(p) > originalDataSize {
-			p = p[:originalDataSize]
+			if originalDataSize == 0 {
+				continue
+			}
+
+			if len(p) > originalDataSize {
+				p = p[:originalDataSize]
+			}
+			n, err := c.ExtendedConn.Read(p)
+			if err != nil {
+				return err
+			}
+			c.readRemaining = originalDataSize - n
+			buffer.Truncate(n)
+			return nil
 		}
-		n, err := c.ExtendedConn.Read(p)
-		if err != nil {
-			return err
-		}
-		c.readPadding++
-		c.readRemaining = originalDataSize - n
-		c.paddingRemaining = paddingLen
-		buffer.Truncate(n)
-		return nil
+		return c.ExtendedConn.ReadBuffer(buffer)
 	}
-	return c.ExtendedConn.ReadBuffer(buffer)
 }
 
 func (c *paddingConn) WriteBuffer(buffer *buf.Buffer) error {

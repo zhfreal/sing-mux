@@ -162,7 +162,9 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 		currentConn := c.getConn()
 		c.stateMu.Lock()
 		if c.client != nil {
-			c.client.Reset()
+			if sess := getSessionFromConn(currentConn); sess != nil {
+				c.client.CloseSession(sess)
+			}
 		}
 		c.stateMu.Unlock()
 
@@ -752,3 +754,23 @@ func (c *clientPacketAddrConn) NeedAdditionalReadDeadline() bool {
 func (c *clientPacketAddrConn) Upstream() any {
 	return c.conn
 }
+
+func getSessionFromConn(conn net.Conn) abstractSession {
+	curr := any(conn)
+	for curr != nil {
+		if s, ok := curr.(interface{ Session() abstractSession }); ok {
+			if sess := s.Session(); sess != nil {
+				return sess
+			}
+		}
+		if u, ok := curr.(interface{ Upstream() any }); ok {
+			curr = u.Upstream()
+		} else if u, ok := curr.(interface{ NetConn() net.Conn }); ok {
+			curr = u.NetConn()
+		} else {
+			break
+		}
+	}
+	return nil
+}
+

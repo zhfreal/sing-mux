@@ -167,7 +167,8 @@ func (c *Client) openStream(ctx context.Context) (net.Conn, error) {
 		wrapper.ConsumeRequest()
 	}
 	ws := &wrapStream{
-		Conn: stream,
+		Conn:    stream,
+		session: session,
 		onClose: func() {
 			if wrapper != nil {
 				wrapper.activeStreams.Add(-1)
@@ -364,6 +365,24 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 		}
 	}
 	return nil
+}
+
+func (c *Client) CloseSession(session abstractSession) {
+	if session == nil {
+		return
+	}
+	c.access.Lock()
+	defer c.access.Unlock()
+	for element := c.connections.Front(); element != nil; element = element.Next() {
+		if element.Value == session {
+			if w, ok := session.(*sessionWrapper); ok && w.timer != nil {
+				w.timer.Stop()
+			}
+			go session.Close()
+			c.connections.Remove(element)
+			break
+		}
+	}
 }
 
 func (c *Client) Reset() {

@@ -15,7 +15,13 @@ This document describes the functional and architectural changes introduced in b
 - **Omission of `Upstream() any`**: Deliberately omitted `Upstream() any` from `clientConn` and `clientConnWithCloseWrite`. This forces external relay loops to always route I/O calls through `clientConn.Read()` and `clientConn.Write()`, preserving wrapper control and enabling seamless underlying stream swapping.
 - **Initial Handshake Buffering & Transparent Replay**:
   - Implemented `firstWriteBuffer` (buffering up to 4 KB) to capture pre-response client handshake payloads (e.g., TLS ClientHello).
-  - On read failure before handshake response (e.g. expired Reality ticket or server reset), `clientConn` automatically invokes `Reset()` on the client, opens a fresh multiplexed stream, and transparently replays `firstWriteBuffer`.
+  - On read failure before handshake response (e.g. expired Reality ticket or server reset), `clientConn` automatically invokes `CloseSession()` on the specific failed session (avoiding catastrophic global resets of unaffected sessions in the client pool), opens a fresh multiplexed stream, and transparently replays `firstWriteBuffer`.
+- **Targeted Session Isolation**:
+  - Added `Session() abstractSession` to `wrapStream` and `wrapStreamCloseWrite`.
+  - Implemented `Client.CloseSession(session)` to cleanly evict and close only the specific failed session while keeping all other concurrent multiplexed sessions active.
+- **Padding Framing & Alignment Resilience (`padding.go`)**:
+  - Stack-allocated 4-byte padding header (`[4]byte`) in `Read()` and `ReadBuffer()` to prevent caller slice contamination.
+  - Properly handled zero-data padding frames (`originalDataSize == 0`) by skipping padding and looping to the next frame instead of returning premature `0, nil`.
 - **Reader & Writer Synchronization**:
   - Introduced `retrying bool` flag and `retryCond *sync.Cond` to serialize readers during connection swaps: reader goroutines wait until the swapper has finished replaying headers and initial payloads before attempting reads on the new connection.
   - Synchronized state transitions via mutexes (`connMu`, `dialMu`, `stateMu`) and condition variables (`requestWriteCond`, `responseReadCond`), preventing concurrent duplicate write replay.

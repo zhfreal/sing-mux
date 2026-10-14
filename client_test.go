@@ -272,3 +272,39 @@ func TestClient_SessionRetirementRollover(t *testing.T) {
 		t.Fatalf("expected connection 1 to be evicted, remaining in list: %d", connCount)
 	}
 }
+
+func TestCloseSessionIsolation(t *testing.T) {
+	s1 := &mockSession{canTake: true}
+	s2 := &mockSession{canTake: true}
+
+	var client Client
+	client.connections.PushBack(s1)
+	client.connections.PushBack(s2)
+
+	if client.connections.Len() != 2 {
+		t.Fatalf("expected 2 connections, got %d", client.connections.Len())
+	}
+
+	// Close only s1
+	client.CloseSession(s1)
+
+	// Wait briefly for asynchronous go session.Close() to finish
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) && !s1.IsClosed() {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if !s1.IsClosed() {
+		t.Fatalf("expected s1 to be closed")
+	}
+	if s2.IsClosed() {
+		t.Fatalf("expected s2 to remain OPEN, but it was closed!")
+	}
+	if client.connections.Len() != 1 {
+		t.Fatalf("expected 1 connection remaining, got %d", client.connections.Len())
+	}
+	if client.connections.Front().Value != s2 {
+		t.Fatalf("expected s2 to be the remaining connection")
+	}
+}
+
