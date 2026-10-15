@@ -63,15 +63,14 @@ var cachedBrutalVersion int32 = -1
 
 func getKernelBrutalVersion(fd int) int {
 	v := atomic.LoadInt32(&cachedBrutalVersion)
-	if v >= 0 {
+	if v > 0 {
 		return int(v)
 	}
 	ver, verErr := unix.GetsockoptInt(fd, unix.IPPROTO_TCP, TCP_BRUTAL_VERSION)
-	if verErr == nil && ver >= 0 {
+	if verErr == nil && ver > 0 {
 		atomic.StoreInt32(&cachedBrutalVersion, int32(ver))
 		return ver
 	}
-	atomic.StoreInt32(&cachedBrutalVersion, 0)
 	return 0
 }
 

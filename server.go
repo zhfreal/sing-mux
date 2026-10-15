@@ -137,7 +137,10 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 					groupID = deriveTenantGroupID(userTenant, req.GroupID)
 				}
 			}
-			gain := uint32(req.CwndGain)
+			gain := s.brutal.CwndGain
+			if gain == 0 {
+				gain = uint32(req.CwndGain)
+			}
 			if gain == 0 {
 				gain = 20
 			}

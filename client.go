@@ -212,8 +212,12 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 		element = element.Next()
 	}
 	if c.brutal.Enabled {
-		if len(sessions) > 0 {
-			sess := sessions[0]
+		available := common.Filter(sessions, abstractSession.CanTakeNewRequest)
+		if len(available) > 0 {
+			sess := available[0]
+			if c.maxStreams > 0 && sess.NumStreams() >= c.maxStreams {
+				return c.offerNew(ctx)
+			}
 			if wrapper, ok := sess.(*sessionWrapper); ok {
 				wrapper.activeStreams.Add(1)
 				wrapper.ConsumeReuse()
@@ -346,11 +350,18 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 	if resp.ReceiveBPS < sendBPS {
 		sendBPS = resp.ReceiveBPS
 	}
-	var groupID uint64
-	if isV2 {
+	groupID := c.brutal.GroupID
+	if isV2 && resp.GroupID != 0 {
 		groupID = resp.GroupID
 	}
-	clientBrutalErr := SetBrutalOptions(sessionConn, sendBPS, groupID, uint32(resp.CwndGain))
+	clientGain := c.brutal.CwndGain
+	if clientGain == 0 {
+		clientGain = uint32(resp.CwndGain)
+	}
+	if clientGain == 0 {
+		clientGain = 20
+	}
+	clientBrutalErr := SetBrutalOptions(sessionConn, sendBPS, groupID, clientGain)
 	if clientBrutalErr != nil {
 		if c.logger != nil {
 			c.logger.Error(E.Cause(clientBrutalErr, "failed to enable TCP Brutal on client socket"))

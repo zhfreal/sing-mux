@@ -131,3 +131,14 @@ The original upstream Brutal bandwidth exchange had structural constraints:
   - Dynamically detects kernel support via `TCP_BRUTAL_VERSION` (`23302`) and formats parameter buffers via `packBrutalParamsV2` (20 bytes: `[rate][cwndGain][groupID]`) or `packBrutalParamsV1` (12 bytes: `[rate][cwndGain]`).
   - Implemented `setsockoptRaw` using `syscall.Syscall6` to avoid runtime memory overheads.
   - Silent `EPERM` error tolerance: If `setsockopt(..., TCP_CONGESTION, "brutal")` or `TCP_BRUTAL_PARAMS` returns `EPERM`, verifies whether the socket already has `"brutal"` assigned by system routing rules (`brutalctl`), and cleanly tolerates permission restrictions without breaking the connection.
+
+---
+
+## Post-Review Fixes & Design Improvements
+
+1. **Kernel Brutal Version Cache Poisoning Prevention (`brutal_linux.go`)**:
+   - Fixed `getKernelBrutalVersion` so transient or pre-connect `getsockopt(TCP_BRUTAL_VERSION)` failures no longer store `0` into `cachedBrutalVersion` and permanently downgrade the process to Brutal v1. Only positive kernel versions (`ver > 0`) are cached.
+2. **Configured `CwndGain` & `GroupID` Preservation Across Brutal Negotiation (`client.go`, `server.go`)**:
+   - Updated `server.go` and `client.go` to honor explicitly configured `s.brutal.CwndGain` / `c.brutal.CwndGain` and `c.brutal.GroupID` when applying `SetBrutalOptions`, since `WriteBrutalRequest` transmits an 8-byte wire frame (`ReceiveBPS` only) to preserve the zero-unread-byte invariant.
+3. **Brutal Session Readiness & Capacity Filtering (`client.go`)**:
+   - Updated the `c.brutal.Enabled` fast path in `offer()` to filter sessions by `abstractSession.CanTakeNewRequest` and respect `c.maxStreams`.
