@@ -64,8 +64,17 @@ func (s *sessionWrapper) IsClosed() bool {
 }
 
 func (s *sessionWrapper) ConsumeReuse() {
-	if s.leftReuseTimes.Load() > 0 {
-		s.leftReuseTimes.Add(-1)
+	for {
+		reuse := s.leftReuseTimes.Load()
+		if reuse <= 0 {
+			return
+		}
+		if s.leftReuseTimes.CompareAndSwap(reuse, reuse-1) {
+			if reuse-1 == 0 {
+				s.retired.Store(true)
+			}
+			return
+		}
 	}
 }
 

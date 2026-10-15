@@ -188,9 +188,17 @@ func (c *paddingConn) WriteBuffer(buffer *buf.Buffer) error {
 	if c.writePadding < kFirstPaddings {
 		bufferLen := buffer.Len()
 		if bufferLen > 65535 {
+			defer buffer.Release()
 			return common.Error(c.Write(buffer.Bytes()))
 		}
 		paddingLen := 256 + rand.Intn(512)
+		if buffer.Start() < 4 || buffer.FreeLen() < paddingLen {
+			newBuf := buf.NewSize(4 + bufferLen + paddingLen)
+			newBuf.Resize(4, 0)
+			common.Must1(newBuf.Write(buffer.Bytes()))
+			buffer.Release()
+			buffer = newBuf
+		}
 		header := buffer.ExtendHeader(4)
 		binary.BigEndian.PutUint16(header[:2], uint16(bufferLen))
 		binary.BigEndian.PutUint16(header[2:], uint16(paddingLen))

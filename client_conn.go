@@ -62,8 +62,11 @@ func (c *clientConn) NeedHandshake() bool {
 	return !c.requestWritten
 }
 
-func (c *clientConn) readResponse() error {
-	response, err := ReadStreamResponse(c.getConn())
+func (c *clientConn) readResponse(conn net.Conn) error {
+	if conn == nil {
+		conn = c.getConn()
+	}
+	response, err := ReadStreamResponse(conn)
 	if err != nil {
 		return err
 	}
@@ -101,6 +104,10 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 	c.retrying = true
 	client := c.client
 	c.stateMu.Unlock()
+
+	if sess := getSessionFromConn(failedConn); sess != nil {
+		client.CloseSession(sess)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -146,7 +153,8 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 		c.responseReading = true
 		c.stateMu.Unlock()
 
-		err = c.readResponse()
+		readConn := c.getConn()
+		err = c.readResponse(readConn)
 
 		c.stateMu.Lock()
 		c.responseReading = false
@@ -155,20 +163,11 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 			c.responseRead = true
 			c.firstWriteBuffer = nil
 			c.stateMu.Unlock()
-			return c.getConn().Read(b)
+			return readConn.Read(b)
 		}
 		c.stateMu.Unlock()
 
-		currentConn := c.getConn()
-		c.stateMu.Lock()
-		if c.client != nil {
-			if sess := getSessionFromConn(currentConn); sess != nil {
-				c.client.CloseSession(sess)
-			}
-		}
-		c.stateMu.Unlock()
-
-		swapped, ok := c.trySwapConnection(currentConn)
+		swapped, ok := c.trySwapConnection(readConn)
 		if ok {
 			if swapped {
 				c.stateMu.Lock()
@@ -184,11 +183,11 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 					continue
 				}
 			} else {
-				// Another goroutine already swapped the connection and replayed
-				// firstWriteBuffer. Wait for its response read to finish, then
-				// delegate to the new connection. A blind `continue` would re-enter
-				// readResponse() on a connection that may still be mid-handshake,
-				// risking an infinite loop or protocol desync.
+				// Another goroutine (e.g. a concurrent Write) already swapped the
+				// connection and replayed firstWriteBuffer. Wait for any in-flight
+				// retry/replay or response read to finish. If responseRead is still
+				// false and the underlying connection changed, loop back so this Read
+				// consumes the handshake response on the new connection.
 				c.stateMu.Lock()
 				for c.retrying {
 					c.retryCond.Wait()
@@ -196,9 +195,14 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 				for !c.responseRead && c.responseReading {
 					c.responseReadCond.Wait()
 				}
+				responseRead := c.responseRead
+				connChanged := c.getConn() != readConn
 				c.stateMu.Unlock()
-				if c.responseRead {
+				if responseRead {
 					return c.getConn().Read(b)
+				}
+				if connChanged {
+					continue
 				}
 			}
 		}

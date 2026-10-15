@@ -15,14 +15,19 @@ import (
 
 type serverConn struct {
 	N.ExtendedConn
+	access          sync.Mutex
 	responseWritten bool
 }
 
 func (c *serverConn) NeedHandshake() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
 	return !c.responseWritten
 }
 
 func (c *serverConn) HandshakeFailure(err error) error {
+	c.access.Lock()
+	defer c.access.Unlock()
 	errMessage := err.Error()
 	buffer := buf.NewSize(1 + rw.UvarintLen(uint64(len(errMessage))) + len(errMessage))
 	defer buffer.Release()
@@ -34,7 +39,9 @@ func (c *serverConn) HandshakeFailure(err error) error {
 }
 
 func (c *serverConn) Write(b []byte) (n int, err error) {
+	c.access.Lock()
 	if c.responseWritten {
+		c.access.Unlock()
 		return c.ExtendedConn.Write(b)
 	}
 	buffer := buf.NewSize(1 + len(b))
@@ -45,22 +52,36 @@ func (c *serverConn) Write(b []byte) (n int, err error) {
 	)
 	_, err = c.ExtendedConn.Write(buffer.Bytes())
 	if err != nil {
+		c.access.Unlock()
 		return
 	}
 	c.responseWritten = true
+	c.access.Unlock()
 	return len(b), nil
 }
 
 func (c *serverConn) WriteBuffer(buffer *buf.Buffer) error {
+	c.access.Lock()
 	if c.responseWritten {
+		c.access.Unlock()
 		return c.ExtendedConn.WriteBuffer(buffer)
+	}
+	if buffer.Start() < 1 {
+		newBuf := buf.NewSize(buffer.Len() + 1)
+		newBuf.Resize(1, 0)
+		common.Must1(newBuf.Write(buffer.Bytes()))
+		buffer.Release()
+		buffer = newBuf
 	}
 	buffer.ExtendHeader(1)[0] = statusSuccess
 	c.responseWritten = true
+	c.access.Unlock()
 	return c.ExtendedConn.WriteBuffer(buffer)
 }
 
 func (c *serverConn) FrontHeadroom() int {
+	c.access.Lock()
+	defer c.access.Unlock()
 	if !c.responseWritten {
 		return 1
 	}
@@ -141,6 +162,7 @@ func (c *serverPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 		return
 	}
 	if cap(p) < int(length) {
+		_, _ = io.CopyN(io.Discard, c.ExtendedConn, int64(length))
 		return 0, nil, io.ErrShortBuffer
 	}
 	n, err = io.ReadFull(c.ExtendedConn, p[:length])
@@ -216,6 +238,7 @@ func (c *serverPacketAddrConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 		return
 	}
 	if cap(p) < int(length) {
+		_, _ = io.CopyN(io.Discard, c.ExtendedConn, int64(length))
 		return 0, nil, io.ErrShortBuffer
 	}
 	n, err = io.ReadFull(c.ExtendedConn, p[:length])

@@ -142,3 +142,27 @@ The original upstream Brutal bandwidth exchange had structural constraints:
    - Updated `server.go` and `client.go` to honor explicitly configured `s.brutal.CwndGain` / `c.brutal.CwndGain` and `c.brutal.GroupID` when applying `SetBrutalOptions`, since `WriteBrutalRequest` transmits an 8-byte wire frame (`ReceiveBPS` only) to preserve the zero-unread-byte invariant.
 3. **Brutal Session Readiness & Capacity Filtering (`client.go`)**:
    - Updated the `c.brutal.Enabled` fast path in `offer()` to filter sessions by `abstractSession.CanTakeNewRequest` and respect `c.maxStreams`.
+
+
+---
+
+## 9. Additional Post-Review Bug Fixes & Hardening
+
+1. **Concurrent Read/Write Stream-Swap Race & Session Eviction (`client_conn.go`)**:
+   - Captured `readConn := c.getConn()` before `c.readResponse(readConn)` so a concurrent `Write()` that swaps `c.conn` on failure cannot cause `Read()` to close and replace the newly established stream.
+   - Moved `c.client.CloseSession(sess)` inside `trySwapConnection(failedConn)` after verifying `c.conn == failedConn` under `dialMu`, ensuring failed sessions are evicted whether `Read()` or `Write()` detects the failure first.
+   - Fixed `Read()` when `trySwapConnection` returns `(swapped=false, ok=true)` (because a concurrent `Write()` already swapped the stream and replayed `firstWriteBuffer`): `Read()` now loops back (`continue`) to read the handshake response on the new stream instead of returning the old stream error.
+2. **Zero-Headroom Buffer Guards, Short-Buffer Draining & Buffer Ownership (`server_conn.go`, `padding.go`)**:
+   - Added mutex synchronization (`access sync.Mutex`) and a `buffer.Start() < 1` reallocation guard to `serverConn.WriteBuffer`.
+   - Added `io.CopyN(io.Discard, c.ExtendedConn, int64(length))` payload draining to `serverPacketConn.ReadFrom` and `serverPacketAddrConn.ReadFrom` on `io.ErrShortBuffer` to preserve frame alignment.
+   - Added `defer buffer.Release()` on the `bufferLen > 65535` path and a front/rear headroom reallocation guard (`buffer.Start() < 4 || buffer.FreeLen() < paddingLen`) in `paddingConn.WriteBuffer`.
+3. **Lock-Free CAS Reuse Quota (`session.go`)**:
+   - Upgraded `sessionWrapper.ConsumeReuse()` to a compare-and-swap (CAS) loop to prevent concurrent reuse decrements from underflowing `0` to `-1` (the unlimited sentinel).
+
+
+## Five-Round Code Review & Remediation Addendum (2026-10-15)
+
+- **Rounds 1–5 Verification (`client.go`, `client_conn.go`, `session.go`, `server.go`, `brutal.go`, `brutal_linux.go`)**:
+  - Verified `activeStreams` atomic reference counting on `sessionWrapper` across `offer`, `offerNew`, `openStream`, and `maybeCloseSession` so newly dialed or reused sessions cannot be prematurely closed by `hMaxReusableSecs` timers before `session.Open()` completes.
+  - Verified `trySwapConnection` and `Read`/`Write` condition-variable coordination (`retryCond`, `requestWriteCond`, `responseReadCond`) when concurrent `Write` and `Read` calls race during stream failover.
+  - Verified UDP short-buffer frame alignment (`io.CopyN(io.Discard, c.conn, int64(length))`) and headroom reallocation in `clientPacketConn` and `clientPacketAddrConn`.
