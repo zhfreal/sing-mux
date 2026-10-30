@@ -19,7 +19,15 @@ import (
 const (
 	MaxHandshakeBufferCapacity = 4096
 	MaxStreamSwapRetries       = 2
+	StreamSwapDialTimeout      = 1 * time.Second
 )
+
+func (c *clientConn) getMaxStreamSwapRetries() int {
+	if c.client != nil && c.client.maxStreamSwapRetries > 0 {
+		return c.client.maxStreamSwapRetries
+	}
+	return MaxStreamSwapRetries
+}
 
 type clientConn struct {
 	connMu sync.RWMutex
@@ -100,7 +108,7 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 	c.connMu.RUnlock()
 
 	c.stateMu.Lock()
-	if c.client == nil || c.retryCount >= 2 || c.responseRead {
+	if c.client == nil || c.retryCount >= c.getMaxStreamSwapRetries() || c.responseRead {
 		c.stateMu.Unlock()
 		return false, false
 	}
@@ -114,7 +122,7 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 		client.CloseSession(sess)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), StreamSwapDialTimeout)
 	defer cancel()
 	newStream, err := client.openStream(ctx)
 	if err != nil {
@@ -222,7 +230,7 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 	c.lazyInit()
 	c.stateMu.Lock()
-	if !isReplay && !c.responseRead && c.client != nil && c.retryCount < MaxStreamSwapRetries {
+	if !isReplay && !c.responseRead && c.client != nil && c.retryCount < c.getMaxStreamSwapRetries() {
 		if len(c.firstWriteBuffer)+len(b) <= MaxHandshakeBufferCapacity {
 			c.firstWriteBuffer = append(c.firstWriteBuffer, b...)
 		} else {

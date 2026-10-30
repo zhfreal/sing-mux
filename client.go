@@ -32,9 +32,10 @@ type Client struct {
 	maxStreams         int
 	padding            bool
 	tcpTimeout         time.Duration
-	maxDrainRetries    int
-	drainRetryInterval time.Duration
-	access             sync.Mutex
+	maxDrainRetries      int
+	drainRetryInterval   time.Duration
+	maxStreamSwapRetries int
+	access               sync.Mutex
 	connections        list.List[abstractSession]
 	brutal             BrutalOptions
 	cMaxReuseTimes     Range
@@ -51,9 +52,10 @@ type Options struct {
 	MaxStreams         int
 	Padding            bool
 	TCPTimeout         time.Duration
-	MaxDrainRetries    int
-	DrainRetryInterval time.Duration
-	Brutal             BrutalOptions
+	MaxDrainRetries      int
+	DrainRetryInterval   time.Duration
+	MaxStreamSwapRetries int
+	Brutal               BrutalOptions
 	CMaxReuseTimes     any
 	HMaxRequestTimes   any
 	HMaxReusableSecs   any
@@ -78,9 +80,10 @@ func NewClient(options Options) (*Client, error) {
 		maxStreams:       options.MaxStreams,
 		padding:            options.Padding,
 		tcpTimeout:         options.TCPTimeout,
-		maxDrainRetries:    options.MaxDrainRetries,
-		drainRetryInterval: options.DrainRetryInterval,
-		brutal:             options.Brutal,
+		maxDrainRetries:      options.MaxDrainRetries,
+		drainRetryInterval:   options.DrainRetryInterval,
+		maxStreamSwapRetries: options.MaxStreamSwapRetries,
+		brutal:               options.Brutal,
 		cMaxReuseTimes:     parseRange(options.CMaxReuseTimes),
 		hMaxRequestTimes:   parseRange(options.HMaxRequestTimes),
 		hMaxReusableSecs:   parseRange(options.HMaxReusableSecs),
@@ -99,6 +102,9 @@ func NewClient(options Options) (*Client, error) {
 	}
 	if client.drainRetryInterval <= 0 {
 		client.drainRetryInterval = DrainRetryInterval
+	}
+	if client.maxStreamSwapRetries <= 0 {
+		client.maxStreamSwapRetries = MaxStreamSwapRetries
 	}
 	switch options.Protocol {
 	case "", "h2mux":
