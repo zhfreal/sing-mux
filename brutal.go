@@ -20,6 +20,7 @@ const (
 	BrutalMinCwndGain    = 5                  // kernel MIN_CWND_GAIN (0.5x)
 	BrutalMaxCwndGain    = 80                 // kernel MAX_CWND_GAIN (8.0x)
 	BrutalDefaultGain    = 20                 // kernel INIT_CWND_GAIN (2.0x)
+	BrutalV2ExtensionLen = 16                 // 4-byte magic + 8-byte groupID + 4-byte cwndGain
 )
 
 type BrutalExchangeRequest struct {
@@ -100,12 +101,12 @@ func ReadBrutalResponse(reader io.Reader, wantV2 bool) (resp BrutalExchangeRespo
 	}
 	resp.ReceiveBPS = binary.BigEndian.Uint64(head[1:9])
 	if wantV2 {
-		var v2Buf [16]byte
+		var v2Buf [BrutalV2ExtensionLen]byte
 		// Use io.ReadFull to detect v2 extension.
 		// If connected to legacy v1 server, server wrote only 9 bytes and closed stream.
 		// Clean EOF / unexpected EOF on 0 bytes indicates legacy v1 server without RST.
 		n, rErr := io.ReadFull(reader, v2Buf[:])
-		if rErr == nil && n == 16 {
+		if rErr == nil && n == BrutalV2ExtensionLen {
 			magic := binary.BigEndian.Uint32(v2Buf[0:4])
 			if magic == BrutalMagicV2 {
 				resp.GroupID = binary.BigEndian.Uint64(v2Buf[4:12])
@@ -148,4 +149,21 @@ func deriveTenantGroupID(userUUID string, clientGroupID uint64) uint64 {
 		return 1
 	}
 	return h
+}
+
+var nativeEndian = binary.NativeEndian
+
+func packBrutalParamsV2(rate uint64, cwndGain uint32, groupID uint64) [20]byte {
+	var b [20]byte
+	nativeEndian.PutUint64(b[0:8], rate)
+	nativeEndian.PutUint32(b[8:12], cwndGain)
+	nativeEndian.PutUint64(b[12:20], groupID)
+	return b
+}
+
+func packBrutalParamsV1(rate uint64, cwndGain uint32) [12]byte {
+	var b [12]byte
+	nativeEndian.PutUint64(b[0:8], rate)
+	nativeEndian.PutUint32(b[8:12], cwndGain)
+	return b
 }

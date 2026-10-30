@@ -1,7 +1,6 @@
 package mux
 
 import (
-	"encoding/binary"
 	"errors"
 	"net"
 	"os"
@@ -23,10 +22,7 @@ const (
 	BrutalVersionV2    = 0x020000
 )
 
-var (
-	nativeEndian = binary.NativeEndian
-	brutalCCName = [7]byte{'b', 'r', 'u', 't', 'a', 'l', 0}
-)
+var brutalCCName = [7]byte{'b', 'r', 'u', 't', 'a', 'l', 0}
 
 func setsockoptRaw(fd int, level int, opt int, ptr unsafe.Pointer, length uintptr) error {
 	_, _, errno := syscall.Syscall6(
@@ -42,21 +38,6 @@ func setsockoptRaw(fd int, level int, opt int, ptr unsafe.Pointer, length uintpt
 		return errno
 	}
 	return nil
-}
-
-func packBrutalParamsV2(rate uint64, cwndGain uint32, groupID uint64) [20]byte {
-	var b [20]byte
-	nativeEndian.PutUint64(b[0:8], rate)
-	nativeEndian.PutUint32(b[8:12], cwndGain)
-	nativeEndian.PutUint64(b[12:20], groupID)
-	return b
-}
-
-func packBrutalParamsV1(rate uint64, cwndGain uint32) [12]byte {
-	var b [12]byte
-	nativeEndian.PutUint64(b[0:8], rate)
-	nativeEndian.PutUint32(b[8:12], cwndGain)
-	return b
 }
 
 var cachedBrutalVersion int32 = -1

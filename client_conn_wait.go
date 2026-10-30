@@ -1,8 +1,6 @@
 package mux
 
 import (
-	"encoding/binary"
-
 	"github.com/metacubex/sing/common/buf"
 	M "github.com/metacubex/sing/common/metadata"
 	N "github.com/metacubex/sing/common/network"
@@ -16,6 +14,8 @@ func (c *clientPacketConn) InitializeReadWaiter(options N.ReadWaitOptions) (need
 }
 
 func (c *clientPacketConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if !c.responseRead {
 		err = c.readResponse()
 		if err != nil {
@@ -23,8 +23,7 @@ func (c *clientPacketConn) WaitReadPacket() (buffer *buf.Buffer, destination M.S
 		}
 		c.responseRead = true
 	}
-	var length uint16
-	err = binary.Read(c.conn, binary.BigEndian, &length)
+	length, err := readUint16(c.conn)
 	if err != nil {
 		return
 	}
@@ -46,6 +45,8 @@ func (c *clientPacketAddrConn) InitializeReadWaiter(options N.ReadWaitOptions) (
 }
 
 func (c *clientPacketAddrConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if !c.responseRead {
 		err = c.readResponse()
 		if err != nil {
@@ -57,8 +58,7 @@ func (c *clientPacketAddrConn) WaitReadPacket() (buffer *buf.Buffer, destination
 	if err != nil {
 		return
 	}
-	var length uint16
-	err = binary.Read(c.conn, binary.BigEndian, &length)
+	length, err := readUint16(c.conn)
 	if err != nil {
 		return
 	}

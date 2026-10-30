@@ -5,6 +5,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"sync"
 
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
@@ -13,11 +14,18 @@ import (
 	"github.com/metacubex/sing/common/rw"
 )
 
-const kFirstPaddings = 16
+const (
+	kFirstPaddings       = 16
+	MaxPaddingPayloadLen = 65535
+	MinPaddingLength     = 256
+	MaxRandomPaddingSpan = 512
+	PaddingHeaderLength  = 4
+	MaxHeadroomPadding   = 1024
+)
 
 type paddingConn struct {
 	N.ExtendedConn
-	writer           N.VectorisedWriter
+	writeAccess      sync.Mutex
 	readPadding      int
 	writePadding     int
 	readRemaining    int
@@ -30,14 +38,12 @@ func newPaddingConn(conn net.Conn) net.Conn {
 		return &vectorisedPaddingConn{
 			paddingConn{
 				ExtendedConn: bufio.NewExtendedConn(conn),
-				writer:       bufio.NewVectorisedWriter(conn),
 			},
 			writer,
 		}
 	} else {
 		return &paddingConn{
 			ExtendedConn: bufio.NewExtendedConn(conn),
-			writer:       bufio.NewVectorisedWriter(conn),
 		}
 	}
 }
@@ -94,10 +100,10 @@ func (c *paddingConn) Read(p []byte) (n int, err error) {
 func (c *paddingConn) Write(p []byte) (n int, err error) {
 	for pLen := len(p); pLen > 0; {
 		var data []byte
-		if pLen > 65535 {
-			data = p[:65535]
-			p = p[65535:]
-			pLen -= 65535
+		if pLen > MaxPaddingPayloadLen {
+			data = p[:MaxPaddingPayloadLen]
+			p = p[MaxPaddingPayloadLen:]
+			pLen -= MaxPaddingPayloadLen
 		} else {
 			data = p
 			pLen = 0
@@ -113,22 +119,25 @@ func (c *paddingConn) Write(p []byte) (n int, err error) {
 }
 
 func (c *paddingConn) write(p []byte) (n int, err error) {
+	c.writeAccess.Lock()
 	if c.writePadding < kFirstPaddings {
-		paddingLen := 256 + rand.Intn(512)
-		buffer := buf.NewSize(4 + len(p) + paddingLen)
+		c.writePadding++
+		paddingLen := MinPaddingLength + rand.Intn(MaxRandomPaddingSpan)
+		buffer := buf.NewSize(PaddingHeaderLength + len(p) + paddingLen)
 		defer buffer.Release()
-		header := buffer.Extend(4)
+		header := buffer.Extend(PaddingHeaderLength)
 		binary.BigEndian.PutUint16(header[:2], uint16(len(p)))
 		binary.BigEndian.PutUint16(header[2:], uint16(paddingLen))
 		common.Must1(buffer.Write(p))
 		buffer.Extend(paddingLen)
 		_, err = c.ExtendedConn.Write(buffer.Bytes())
+		c.writeAccess.Unlock()
 		if err == nil {
 			n = len(p)
 		}
-		c.writePadding++
 		return
 	}
+	c.writeAccess.Unlock()
 	return c.ExtendedConn.Write(p)
 }
 
@@ -185,31 +194,37 @@ func (c *paddingConn) ReadBuffer(buffer *buf.Buffer) error {
 }
 
 func (c *paddingConn) WriteBuffer(buffer *buf.Buffer) error {
+	c.writeAccess.Lock()
 	if c.writePadding < kFirstPaddings {
 		bufferLen := buffer.Len()
-		if bufferLen > 65535 {
+		if bufferLen > MaxPaddingPayloadLen {
+			c.writeAccess.Unlock()
 			defer buffer.Release()
 			return common.Error(c.Write(buffer.Bytes()))
 		}
-		paddingLen := 256 + rand.Intn(512)
-		if buffer.Start() < 4 || buffer.FreeLen() < paddingLen {
-			newBuf := buf.NewSize(4 + bufferLen + paddingLen)
-			newBuf.Resize(4, 0)
+		c.writePadding++
+		paddingLen := MinPaddingLength + rand.Intn(MaxRandomPaddingSpan)
+		if buffer.Start() < PaddingHeaderLength || buffer.FreeLen() < paddingLen {
+			newBuf := buf.NewSize(PaddingHeaderLength + bufferLen + paddingLen)
+			newBuf.Resize(PaddingHeaderLength, 0)
 			common.Must1(newBuf.Write(buffer.Bytes()))
 			buffer.Release()
 			buffer = newBuf
 		}
-		header := buffer.ExtendHeader(4)
+		header := buffer.ExtendHeader(PaddingHeaderLength)
 		binary.BigEndian.PutUint16(header[:2], uint16(bufferLen))
 		binary.BigEndian.PutUint16(header[2:], uint16(paddingLen))
 		buffer.Extend(paddingLen)
-		c.writePadding++
+		err := c.ExtendedConn.WriteBuffer(buffer)
+		c.writeAccess.Unlock()
+		return err
 	}
+	c.writeAccess.Unlock()
 	return c.ExtendedConn.WriteBuffer(buffer)
 }
 
 func (c *paddingConn) FrontHeadroom() int {
-	return 4 + 256 + 1024
+	return PaddingHeaderLength + MinPaddingLength + MaxHeadroomPadding
 }
 
 func (c *paddingConn) Upstream() any {
@@ -222,9 +237,11 @@ type vectorisedPaddingConn struct {
 }
 
 func (c *vectorisedPaddingConn) WriteVectorised(buffers []*buf.Buffer) error {
+	c.writeAccess.Lock()
 	if c.writePadding < kFirstPaddings {
 		bufferLen := buf.LenMulti(buffers)
-		if bufferLen > 65535 {
+		if bufferLen > MaxPaddingPayloadLen {
+			c.writeAccess.Unlock()
 			defer buf.ReleaseMulti(buffers)
 			for _, buffer := range buffers {
 				_, err := c.Write(buffer.Bytes())
@@ -234,16 +251,19 @@ func (c *vectorisedPaddingConn) WriteVectorised(buffers []*buf.Buffer) error {
 			}
 			return nil
 		}
-		paddingLen := 256 + rand.Intn(512)
-		header := buf.NewSize(4)
-		common.Must(
-			binary.Write(header, binary.BigEndian, uint16(bufferLen)),
-			binary.Write(header, binary.BigEndian, uint16(paddingLen)),
-		)
 		c.writePadding++
+		paddingLen := MinPaddingLength + rand.Intn(MaxRandomPaddingSpan)
+		header := buf.NewSize(PaddingHeaderLength)
+		hdrBytes := header.Extend(PaddingHeaderLength)
+		binary.BigEndian.PutUint16(hdrBytes[:2], uint16(bufferLen))
+		binary.BigEndian.PutUint16(hdrBytes[2:], uint16(paddingLen))
 		padding := buf.NewSize(paddingLen)
 		padding.Extend(paddingLen)
 		buffers = append(append([]*buf.Buffer{header}, buffers...), padding)
+		err := c.writer.WriteVectorised(buffers)
+		c.writeAccess.Unlock()
+		return err
 	}
+	c.writeAccess.Unlock()
 	return c.writer.WriteVectorised(buffers)
 }

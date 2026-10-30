@@ -35,31 +35,40 @@ type Request struct {
 	Padding  bool
 }
 
+func readUint16(reader io.Reader) (uint16, error) {
+	var b [2]byte
+	if _, err := io.ReadFull(reader, b[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint16(b[:]), nil
+}
+
+func writeUint16(writer io.Writer, v uint16) error {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], v)
+	_, err := writer.Write(b[:])
+	return err
+}
+
 func ReadRequest(reader io.Reader) (*Request, error) {
-	var (
-		version  byte
-		protocol byte
-	)
-	err := binary.Read(reader, binary.BigEndian, &version)
-	if err != nil {
+	var header [2]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		return nil, err
 	}
+	version := header[0]
+	protocol := header[1]
 	if version < Version0 || version > Version1 {
 		return nil, E.New("unsupported version: ", version)
 	}
-	err = binary.Read(reader, binary.BigEndian, &protocol)
-	if err != nil {
-		return nil, err
-	}
 	var paddingEnabled bool
 	if version == Version1 {
-		err = binary.Read(reader, binary.BigEndian, &paddingEnabled)
-		if err != nil {
+		var padByte [1]byte
+		if _, err := io.ReadFull(reader, padByte[:]); err != nil {
 			return nil, err
 		}
+		paddingEnabled = padByte[0] != 0
 		if paddingEnabled {
-			var paddingLen uint16
-			err = binary.Read(reader, binary.BigEndian, &paddingLen)
+			paddingLen, err := readUint16(reader)
 			if err != nil {
 				return nil, err
 			}
@@ -90,9 +99,13 @@ func EncodeRequest(request Request, payload []byte) *buf.Buffer {
 		buffer.WriteByte(request.Protocol),
 	)
 	if request.Version == Version1 {
-		common.Must(binary.Write(buffer, binary.BigEndian, request.Padding))
+		var padByte byte
 		if request.Padding {
-			common.Must(binary.Write(buffer, binary.BigEndian, paddingLen))
+			padByte = 1
+		}
+		common.Must(buffer.WriteByte(padByte))
+		if request.Padding {
+			binary.BigEndian.PutUint16(buffer.Extend(2), paddingLen)
 			buffer.Extend(int(paddingLen))
 		}
 	}
@@ -114,8 +127,7 @@ type StreamRequest struct {
 }
 
 func ReadStreamRequest(reader io.Reader) (*StreamRequest, error) {
-	var flags uint16
-	err := binary.Read(reader, binary.BigEndian, &flags)
+	flags, err := readUint16(reader)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +166,7 @@ func EncodeStreamRequest(request StreamRequest, buffer *buf.Buffer) error {
 			destination = Destination
 		}
 	}
-	common.Must(binary.Write(buffer, binary.BigEndian, flags))
+	binary.BigEndian.PutUint16(buffer.Extend(2), flags)
 	return M.SocksaddrSerializer.WriteAddrPort(buffer, destination)
 }
 
@@ -164,12 +176,13 @@ type StreamResponse struct {
 }
 
 func ReadStreamResponse(reader io.Reader) (*StreamResponse, error) {
-	var response StreamResponse
-	err := binary.Read(reader, binary.BigEndian, &response.Status)
-	if err != nil {
+	var statusBuf [1]byte
+	if _, err := io.ReadFull(reader, statusBuf[:]); err != nil {
 		return nil, err
 	}
+	response := StreamResponse{Status: statusBuf[0]}
 	if response.Status == statusError {
+		var err error
 		response.Message, err = rw.ReadVString(reader)
 		if err != nil {
 			return nil, err

@@ -16,6 +16,11 @@ import (
 	N "github.com/metacubex/sing/common/network"
 )
 
+const (
+	MaxHandshakeBufferCapacity = 4096
+	MaxStreamSwapRetries       = 2
+)
+
 type clientConn struct {
 	connMu sync.RWMutex
 	conn   net.Conn
@@ -196,8 +201,8 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 					c.responseReadCond.Wait()
 				}
 				responseRead := c.responseRead
-				connChanged := c.getConn() != readConn
 				c.stateMu.Unlock()
+				connChanged := c.getConn() != readConn
 				if responseRead {
 					return c.getConn().Read(b)
 				}
@@ -217,8 +222,8 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 	c.lazyInit()
 	c.stateMu.Lock()
-	if !isReplay && !c.responseRead && c.client != nil && c.retryCount < 2 {
-		if len(c.firstWriteBuffer)+len(b) <= 4096 {
+	if !isReplay && !c.responseRead && c.client != nil && c.retryCount < MaxStreamSwapRetries {
+		if len(c.firstWriteBuffer)+len(b) <= MaxHandshakeBufferCapacity {
 			c.firstWriteBuffer = append(c.firstWriteBuffer, b...)
 		} else {
 			c.client = nil
@@ -325,6 +330,19 @@ func (c *clientConn) Close() error {
 	conn := c.conn
 	c.connMu.Unlock()
 
+	c.stateMu.Lock()
+	c.firstWriteBuffer = nil
+	if c.retryCond != nil {
+		c.retryCond.Broadcast()
+	}
+	if c.requestWriteCond != nil {
+		c.requestWriteCond.Broadcast()
+	}
+	if c.responseReadCond != nil {
+		c.responseReadCond.Broadcast()
+	}
+	c.stateMu.Unlock()
+
 	if conn != nil {
 		return conn.Close()
 	}
@@ -405,6 +423,7 @@ type clientPacketConn struct {
 	N.AbstractConn
 	conn            N.ExtendedConn
 	access          sync.Mutex
+	readAccess      sync.Mutex
 	destination     M.Socksaddr
 	requestWritten  bool
 	responseRead    bool
@@ -412,6 +431,8 @@ type clientPacketConn struct {
 }
 
 func (c *clientPacketConn) NeedHandshake() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
 	return !c.requestWritten
 }
 
@@ -427,6 +448,8 @@ func (c *clientPacketConn) readResponse() error {
 }
 
 func (c *clientPacketConn) Read(b []byte) (n int, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if !c.responseRead {
 		err = c.readResponse()
 		if err != nil {
@@ -434,8 +457,7 @@ func (c *clientPacketConn) Read(b []byte) (n int, err error) {
 		}
 		c.responseRead = true
 	}
-	var length uint16
-	err = binary.Read(c.conn, binary.BigEndian, &length)
+	length, err := readUint16(c.conn)
 	if err != nil {
 		return
 	}
@@ -462,10 +484,8 @@ func (c *clientPacketConn) writeRequest(payload []byte) (n int, err error) {
 		return
 	}
 	if len(payload) > 0 {
-		common.Must(
-			binary.Write(buffer, binary.BigEndian, uint16(len(payload))),
-			common.Error(buffer.Write(payload)),
-		)
+		binary.BigEndian.PutUint16(buffer.Extend(2), uint16(len(payload)))
+		common.Must1(buffer.Write(payload))
 	}
 	_, err = c.conn.Write(buffer.Bytes())
 	if err != nil {
@@ -481,7 +501,7 @@ func (c *clientPacketConn) Write(b []byte) (n int, err error) {
 	if !c.requestWritten {
 		return c.writeRequest(b)
 	}
-	err = binary.Write(c.conn, binary.BigEndian, uint16(len(b)))
+	err = writeUint16(c.conn, uint16(len(b)))
 	if err != nil {
 		return
 	}
@@ -489,6 +509,8 @@ func (c *clientPacketConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *clientPacketConn) ReadBuffer(buffer *buf.Buffer) (err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if !c.responseRead {
 		err = c.readResponse()
 		if err != nil {
@@ -496,8 +518,7 @@ func (c *clientPacketConn) ReadBuffer(buffer *buf.Buffer) (err error) {
 		}
 		c.responseRead = true
 	}
-	var length uint16
-	err = binary.Read(c.conn, binary.BigEndian, &length)
+	length, err := readUint16(c.conn)
 	if err != nil {
 		return
 	}
@@ -530,6 +551,8 @@ func (c *clientPacketConn) FrontHeadroom() int {
 }
 
 func (c *clientPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if !c.responseRead {
 		err = c.readResponse()
 		if err != nil {
@@ -537,8 +560,7 @@ func (c *clientPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 		}
 		c.responseRead = true
 	}
-	var length uint16
-	err = binary.Read(c.conn, binary.BigEndian, &length)
+	length, err := readUint16(c.conn)
 	if err != nil {
 		return
 	}
@@ -556,7 +578,7 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if !c.requestWritten {
 		return c.writeRequest(p)
 	}
-	err = binary.Write(c.conn, binary.BigEndian, uint16(len(p)))
+	err = writeUint16(c.conn, uint16(len(p)))
 	if err != nil {
 		return
 	}
@@ -594,6 +616,7 @@ type clientPacketAddrConn struct {
 	N.AbstractConn
 	conn            N.ExtendedConn
 	access          sync.Mutex
+	readAccess      sync.Mutex
 	destination     M.Socksaddr
 	requestWritten  bool
 	responseRead    bool
@@ -601,6 +624,8 @@ type clientPacketAddrConn struct {
 }
 
 func (c *clientPacketAddrConn) NeedHandshake() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
 	return !c.requestWritten
 }
 
@@ -616,6 +641,8 @@ func (c *clientPacketAddrConn) readResponse() error {
 }
 
 func (c *clientPacketAddrConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if !c.responseRead {
 		err = c.readResponse()
 		if err != nil {
@@ -632,8 +659,7 @@ func (c *clientPacketAddrConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 	} else {
 		addr = destination.UDPAddr()
 	}
-	var length uint16
-	err = binary.Read(c.conn, binary.BigEndian, &length)
+	length, err := readUint16(c.conn)
 	if err != nil {
 		return
 	}
@@ -666,10 +692,8 @@ func (c *clientPacketAddrConn) writeRequest(payload []byte, destination M.Socksa
 		if err != nil {
 			return
 		}
-		common.Must(
-			binary.Write(buffer, binary.BigEndian, uint16(len(payload))),
-			common.Error(buffer.Write(payload)),
-		)
+		binary.BigEndian.PutUint16(buffer.Extend(2), uint16(len(payload)))
+		common.Must1(buffer.Write(payload))
 	}
 	_, err = c.conn.Write(buffer.Bytes())
 	if err != nil {
@@ -689,7 +713,7 @@ func (c *clientPacketAddrConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 	if err != nil {
 		return
 	}
-	err = binary.Write(c.conn, binary.BigEndian, uint16(len(p)))
+	err = writeUint16(c.conn, uint16(len(p)))
 	if err != nil {
 		return
 	}
@@ -697,6 +721,8 @@ func (c *clientPacketAddrConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 }
 
 func (c *clientPacketAddrConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	if !c.responseRead {
 		err = c.readResponse()
 		if err != nil {
@@ -708,8 +734,7 @@ func (c *clientPacketAddrConn) ReadPacket(buffer *buf.Buffer) (destination M.Soc
 	if err != nil {
 		return
 	}
-	var length uint16
-	err = binary.Read(c.conn, binary.BigEndian, &length)
+	length, err := readUint16(c.conn)
 	if err != nil {
 		return
 	}
@@ -739,7 +764,7 @@ func (c *clientPacketAddrConn) WritePacket(buffer *buf.Buffer, destination M.Soc
 	if err != nil {
 		return err
 	}
-	common.Must(binary.Write(header, binary.BigEndian, uint16(bLen)))
+	binary.BigEndian.PutUint16(header.Extend(2), uint16(bLen))
 	return c.conn.WriteBuffer(buffer)
 }
 

@@ -16,36 +16,47 @@ import (
 	"github.com/metacubex/sing/common/x/list"
 )
 
+const (
+	DefaultTCPTimeout    = 500 * time.Millisecond
+	DefaultMinStreams    = 8
+	MaxDrainRetries      = 10
+	DrainRetryInterval   = 50 * time.Millisecond
+)
+
 type Client struct {
-	dialer           N.Dialer
-	logger           logger.Logger
-	protocol         byte
-	maxConnections   int
-	minStreams       int
-	maxStreams       int
-	padding          bool
-	tcpTimeout       time.Duration
-	access           sync.Mutex
-	connections      list.List[abstractSession]
-	brutal           BrutalOptions
-	cMaxReuseTimes   Range
-	hMaxRequestTimes Range
-	hMaxReusableSecs Range
+	dialer             N.Dialer
+	logger             logger.Logger
+	protocol           byte
+	maxConnections     int
+	minStreams         int
+	maxStreams         int
+	padding            bool
+	tcpTimeout         time.Duration
+	maxDrainRetries    int
+	drainRetryInterval time.Duration
+	access             sync.Mutex
+	connections        list.List[abstractSession]
+	brutal             BrutalOptions
+	cMaxReuseTimes     Range
+	hMaxRequestTimes   Range
+	hMaxReusableSecs   Range
 }
 
 type Options struct {
-	Dialer           N.Dialer
-	Logger           logger.Logger
-	Protocol         string
-	MaxConnections   int
-	MinStreams       int
-	MaxStreams       int
-	Padding          bool
-	TCPTimeout       time.Duration
-	Brutal           BrutalOptions
-	CMaxReuseTimes   any
-	HMaxRequestTimes any
-	HMaxReusableSecs any
+	Dialer             N.Dialer
+	Logger             logger.Logger
+	Protocol           string
+	MaxConnections     int
+	MinStreams         int
+	MaxStreams         int
+	Padding            bool
+	TCPTimeout         time.Duration
+	MaxDrainRetries    int
+	DrainRetryInterval time.Duration
+	Brutal             BrutalOptions
+	CMaxReuseTimes     any
+	HMaxRequestTimes   any
+	HMaxReusableSecs   any
 }
 
 type BrutalOptions struct {
@@ -65,21 +76,29 @@ func NewClient(options Options) (*Client, error) {
 		maxConnections:   options.MaxConnections,
 		minStreams:       options.MinStreams,
 		maxStreams:       options.MaxStreams,
-		padding:          options.Padding,
-		tcpTimeout:       options.TCPTimeout,
-		brutal:           options.Brutal,
-		cMaxReuseTimes:   parseRange(options.CMaxReuseTimes),
-		hMaxRequestTimes: parseRange(options.HMaxRequestTimes),
-		hMaxReusableSecs: parseRange(options.HMaxReusableSecs),
+		padding:            options.Padding,
+		tcpTimeout:         options.TCPTimeout,
+		maxDrainRetries:    options.MaxDrainRetries,
+		drainRetryInterval: options.DrainRetryInterval,
+		brutal:             options.Brutal,
+		cMaxReuseTimes:     parseRange(options.CMaxReuseTimes),
+		hMaxRequestTimes:   parseRange(options.HMaxRequestTimes),
+		hMaxReusableSecs:   parseRange(options.HMaxReusableSecs),
 	}
 	if client.dialer == nil {
 		client.dialer = N.SystemDialer
 	}
 	if client.maxStreams == 0 && client.maxConnections == 0 {
-		client.minStreams = 8
+		client.minStreams = DefaultMinStreams
 	}
 	if client.tcpTimeout == 0 {
-		client.tcpTimeout = 500 * time.Millisecond
+		client.tcpTimeout = DefaultTCPTimeout
+	}
+	if client.maxDrainRetries <= 0 {
+		client.maxDrainRetries = MaxDrainRetries
+	}
+	if client.drainRetryInterval <= 0 {
+		client.drainRetryInterval = DrainRetryInterval
 	}
 	switch options.Protocol {
 	case "", "h2mux":
@@ -198,7 +217,7 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 			continue
 		}
 		if wrapper, ok := sess.(*sessionWrapper); ok && wrapper.isRetired(now) {
-			if wrapper.activeStreams.Load() == 0 && wrapper.NumStreams() == 0 {
+			if wrapper.activeStreams.Load() <= 0 && wrapper.NumStreams() <= 0 {
 				wrapper.Close()
 				nextElement := element.Next()
 				c.connections.Remove(element)
@@ -421,8 +440,16 @@ func (c *Client) maybeCloseSession(s *sessionWrapper, retries int) {
 		return
 	}
 	if s.NumStreams() > 0 {
-		if retries < 10 {
-			time.AfterFunc(50*time.Millisecond, func() {
+		maxRetries := c.maxDrainRetries
+		if maxRetries <= 0 {
+			maxRetries = MaxDrainRetries
+		}
+		interval := c.drainRetryInterval
+		if interval <= 0 {
+			interval = DrainRetryInterval
+		}
+		if retries < maxRetries {
+			time.AfterFunc(interval, func() {
 				c.maybeCloseSession(s, retries+1)
 			})
 			return

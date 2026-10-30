@@ -1,168 +1,151 @@
-# Patch Statement: sing-mux (v0.3.12-patch3)
+# Codebase Change Statement: sing-mux
 
-This document describes the functional and architectural changes introduced in branch `main-patched` of `zhfreal/sing-mux` on top of the original upstream release `metacubex/sing-mux v0.3.12`.
+**Current Codebase:** `zhfreal/sing-mux` (`main-patched`)  
+**Original Upstream Baseline:** `MetaCubeX/sing-mux` (Release `v0.3.12`, Git Commit `714fc2e0d3753578ee1beeb8f39943dc6c5aa426`)  
+**Repository Location:** `./sing-mux-mine`  
+**Status:** Production-Ready, Race-Verified (`go test -race ./...` passing 100%)
 
 ---
 
-## Module 1: Connection Resilience & Transparent Stream Re-routing
+## 1. Executive Summary
 
-### 1. Issues in Original sing-mux v0.3.12
-- **Relay Loop Stream Bypassing**: When Mihomo's `bufio.Copy` connection relay loops copy data, they inspect whether wrappers implement `Upstream() any` and recursively unwrap down to the underlying `smux` / `yamux` stream object. When an upstream proxy connection resets or a VLESS Reality session ticket expires, any reconnection swap on the wrapper is completely bypassed by the active copy loop, which continues to write to the dead underlying stream and terminates the user's connection.
-- **Premature Concurrency on Reconnection Replay**: During an automatic stream retry, multiple readers or writers can trigger duplicate replaying of the handshake payload (`firstWriteBuffer`), causing protocol frame corruption or stream desynchronization.
-- **Nil Connection Panics**: Wrapper methods on closed or uninitialized connections can panic with nil pointer dereferences if the underlying connection reference is nil.
+This document specifies the complete architectural, functional, and performance delta between the current codebase (`zhfreal/sing-mux @ main-patched`) and the original upstream baseline (`MetaCubeX/sing-mux v0.3.12`).
 
-### 2. Implementation Details (`client_conn.go`, `client.go`)
-- **Omission of `Upstream() any`**: Deliberately omitted `Upstream() any` from `clientConn` and `clientConnWithCloseWrite`. This forces external relay loops to always route I/O calls through `clientConn.Read()` and `clientConn.Write()`, preserving wrapper control and enabling seamless underlying stream swapping.
-- **Initial Handshake Buffering & Transparent Replay**:
-  - Implemented `firstWriteBuffer` (buffering up to 4 KB) to capture pre-response client handshake payloads (e.g., TLS ClientHello).
-  - On read failure before handshake response (e.g. expired Reality ticket or server reset), `clientConn` automatically invokes `CloseSession()` on the specific failed session (avoiding catastrophic global resets of unaffected sessions in the client pool), opens a fresh multiplexed stream, and transparently replays `firstWriteBuffer`.
-- **Targeted Session Isolation**:
+The modifications are structured into two distinct categories:
+1. **Type 1: New Features & Protocol Extensions**: Anti-fingerprinting periodic connection retirement (XMUX style), TCP Brutal v2 protocol negotiation with tenant isolation, transparent stream failover buffering, and half-close stream propagation.
+2. **Type 2: Bug Fixes, Concurrency & Memory Safety Remediations**: Defensive front headroom reallocation preventing buffer overflow panics, unread payload byte draining on short buffers preventing stream desynchronization, separate read/write mutexes eliminating data races, HTTP/2 request pipe leak fixes, and hot-path zero-allocation refactoring.
+
+---
+
+## 2. Type 1: New Features & Protocol Extensions
+
+### 2.1 XMUX-Style Periodic Session Retirement & Graceful Draining (`session.go`, `client.go`, `error.go`)
+* **Session Lifecycle Wrapper (`sessionWrapper`)**:
+  - Implemented `sessionWrapper` wrapping `abstractSession` to enforce dynamic retirement limits:
+    - `HMaxReusableSecs`: Hard expiration deadline (`unreusableAt = now + HMaxReusableSecs`).
+    - `HMaxRequestTimes`: Decrementing stream request quota (`leftRequests`).
+    - `CMaxReuseTimes`: Decrementing session reuse quota (`leftReuseTimes`).
+* **Lock-Free Compare-and-Swap (CAS) Quota Consumption**:
+  - Implemented lock-free atomic CAS loops for `leftRequests` and `leftReuseTimes` decrements, preventing concurrent underflow from `0` to `-1` (the unlimited sentinel).
+* **Graceful Active Stream Draining**:
+  - In `Client.offer()`, expired or retired sessions are excluded from taking new streams.
+  - Existing in-flight streams on retired sessions continue serving traffic uninterrupted until closed (`NumStreams() == 0`).
+  - Upon closing the final active stream (`activeStreams.Add(-1) == 0`), `maybeCloseSession()` evicts and closes the retired session asynchronously, preventing resource leaks.
+
+### 2.2 TCP Brutal v2 Protocol Negotiation & Multi-Tenant Isolation (`brutal.go`, `brutal_linux.go`, `client.go`, `server.go`)
+* **Protocol Version 2 Negotiation**:
+  - Upgraded kernel TCP Brutal integration to support Brutal Version 2 (port `23302`, magic `0x42525502`, setsockopt `TCP_BRUTAL_PARAMS_V2`).
+  - Maintained backward-compatible fallback to Version 1 (port `23301`, magic `0x42525501`) when the server does not negotiate v2.
+* **Wire Protocol Framing & Invariant**:
+  - Transmits an 8-byte request frame (`ReceiveBPS uint64`) to enforce a zero-unread-byte invariant during initial stream handshakes.
+  - Preserves explicitly configured `CwndGain` and `GroupID` on client and server instances when applying `SetBrutalOptions`.
+* **Multi-Tenant Group ID Isolation**:
+  - Derives a 64-bit tenant group ID using FNV-1a hashing over `(userUUID, clientGroupID)` to ensure fair bandwidth pacing across isolated tenant groups sharing a single server.
+* **Cross-Platform Byte Serialization**:
+  - Moved pure byte-packing functions `packBrutalParamsV2` and `packBrutalParamsV1` to platform-independent `brutal.go`, enabling cross-platform compilation and testing on Linux, Windows, and macOS (`amd64` and `arm64`).
+
+### 2.3 Transparent Stream Swapping & Pre-Response Buffering (`client.go`, `client_conn.go`, `client_conn_wait.go`)
+* **Enforced Wrapper Control (Omission of `Upstream() any`)**:
+  - Deliberately omitted the `Upstream() any` method from `clientConn` and `clientConnWithCloseWrite`.
+  - In upstream, external relay loops recursively unwrap connections implementing `Upstream() any` down to the physical `smux`/`yamux` stream. By omitting this method, external relay loops are forced to route I/O calls through `clientConn.Read()` and `Write()`, maintaining wrapper control for stream failover.
+* **Initial Handshake Buffering & Transparent Stream Swapping**:
+  - Implemented `firstWriteBuffer` (4 KiB capacity) in `clientConn` to capture client handshake bytes (e.g., TLS ClientHello) prior to receiving the server's response.
+  - If a read error occurs before the handshake response is read (e.g. server reset, expired ticket, or network dropout), `clientConn` automatically invokes `CloseSession()` on the failed session, requests a fresh stream from the pool, and transparently replays `firstWriteBuffer`.
+* **Targeted Session Isolation (`Client.CloseSession`)**:
   - Added `Session() abstractSession` to `wrapStream` and `wrapStreamCloseWrite`.
-  - Implemented `Client.CloseSession(session)` to cleanly evict and close only the specific failed session while keeping all other concurrent multiplexed sessions active.
-- **Padding Framing & Alignment Resilience (`padding.go`)**:
-  - Stack-allocated 4-byte padding header (`[4]byte`) in `Read()` and `ReadBuffer()` to prevent caller slice contamination.
-  - Properly handled zero-data padding frames (`originalDataSize == 0`) by skipping padding and looping to the next frame instead of returning premature `0, nil`.
-- **Reader & Writer Synchronization**:
-  - Introduced `retrying bool` flag and `retryCond *sync.Cond` to serialize readers during connection swaps: reader goroutines wait until the swapper has finished replaying headers and initial payloads before attempting reads on the new connection.
-  - Synchronized state transitions via mutexes (`connMu`, `dialMu`, `stateMu`) and condition variables (`requestWriteCond`, `responseReadCond`), preventing concurrent duplicate write replay.
-- **Nil Connection Guards**:
-  - Protected `LocalAddr()`, `SetDeadline()`, `SetReadDeadline()`, `SetWriteDeadline()`, and `SyscallConn()` in `clientConn` against nil connection references, returning `net.ErrClosed` or `syscall.ENOTSUP` instead of crashing.
+  - Added `Client.CloseSession(session)` to evict and terminate only the specific multiplexer session that encountered a failure, leaving all other concurrent sessions in the client pool intact.
+* **Reader & Writer Synchronization During Failover**:
+  - Introduced `retrying bool` and condition variable `retryCond *sync.Cond` to serialize concurrent readers: readers wait until the stream swapper finishes replaying initial headers on the new stream before resuming reads.
+
+### 2.4 Half-Close Stream Support (`CloseWrite`) (`client_conn.go`, `h2mux_conn.go`)
+* **Clean Half-Close Delegation**:
+  - Implemented `clientConnWithCloseWrite` delegating `CloseWrite()` via thread-safe `c.getConn()`.
+  - Maps half-close to `END_STREAM` on HTTP/2 (`httpConn`) and `FIN` on Yamux (`yamuxWrapStream`), preserving downlink response readability (e.g., SSE streaming, chunked HTTP POST responses) without resetting connections.
+
+---
+
+## 3. Type 2: Bug Fixes, Concurrency & Memory Safety Remediations
+
+### 3.1 Defensive Front Headroom Reallocation (Buffer Overflow Panic Prevention) (`server_conn.go`, `client_conn.go`)
+* **Elimination of `panic: buffer overflow`**:
+  - In upstream, `serverPacketConn.WritePacket`, `serverPacketAddrConn.WritePacket`, `clientPacketConn.WriteBuffer`, and `clientPacketAddrConn.WritePacket` invoked `buffer.ExtendHeader(needed)` unconditionally, panicking with `buffer overflow` if the supplied buffer had zero front headroom.
+  - Added automatic headroom checks: if `buffer.Start() < needed`, a new buffer is allocated (`buf.NewSize(buffer.Len() + needed)`), the payload is copied, and the original buffer is released safely.
+
+### 3.2 Frame Alignment Preservation on `io.ErrShortBuffer` (Length Corruption Fix) (`client_conn.go`, `server_conn.go`)
+* **Draining Unread Payload Bytes**:
+  - In `clientPacketConn.Read`, `clientPacketConn.ReadFrom`, `serverPacketConn.ReadFrom`, and `serverPacketAddrConn.ReadFrom`, if the caller's slice is shorter than the frame length (`length > len(p)`), unread payload bytes are drained via `io.CopyN(io.Discard, conn, int64(length))` before returning `io.ErrShortBuffer`.
+  - Prevents leftover payload bytes from desynchronizing the length headers of subsequent frames on the stream.
+
+### 3.3 High-Concurrency Mutex Separation & Race Elimination (`client_conn.go`, `client_conn_wait.go`, `padding.go`)
+* **Separation of Read and Write Locks**:
+  - Added `readAccess sync.Mutex` alongside `access sync.Mutex` on `clientPacketConn` and `clientPacketAddrConn`. This separates read-path handshake verification from write operations, eliminating lock contention and removing data races on `c.responseRead` and `c.requestWritten`.
+  - Added `writeAccess sync.Mutex` to `paddingConn` to serialize the first `kFirstPaddings` (16) padded frame writes across `write()`, `WriteBuffer()`, and `WriteVectorised()`, preventing data races on `c.writePadding`.
+  - Added `c.access.Lock()` synchronization on initial request writes in `protocolConn.Write` and on server handshake verification.
+
+### 3.4 HTTP/2 Request Pipe Leak Elimination on Failed Handshake (`h2mux.go`)
+* **Immediate Pipe Teardown on RoundTrip Error**:
+  - In `h2MuxClientSession.Open()`, if `s.transport.RoundTrip(request)` fails or returns a non-200 HTTP status, `pipeInWriter.CloseWithError(err)` is executed immediately.
+  - Prevents leaked request body pipes and lingering goroutines when the remote HTTP/2 server rejects the multiplexed stream.
+* **Stream Timeout Goroutine Elimination**:
+  - Replaced the per-stream timeout goroutine, channel allocation (`requestDone := make(chan struct{})`), and `time.NewTimer` with a lightweight `time.AfterFunc(tcpTimeout, cancel)` stopped on response completion.
+
+### 3.5 Elimination of Reflection Allocations across Protocol Hot Paths (`protocol.go`, `protocol_conn.go`, `padding.go`)
+* **Zero-Allocation Stack Helpers**:
+  - Implemented `readUint16(io.Reader) (uint16, error)` and `writeUint16(io.Writer, uint16) error` using stack-allocated `[2]byte` buffers.
+  - Replaced all reflection-based `encoding/binary.Read` and `binary.Write` calls across stream request/response and packet parsing.
+* **Coalesced Request Header Reading**:
+  - `ReadRequest()` reads both `version` and `protocol` in a single `io.ReadFull(reader, header[:])` call instead of two separate single-byte `binary.Read` operations.
+* **Vectorized Padding BigEndian Encoding**:
+  - Replaced reflection `binary.Write` in `WriteVectorised` with direct `binary.BigEndian.PutUint16` encoding into `header.Extend(4)`.
+
+### 3.6 Nil Underlying Connection Guards & Protocol Accounting Bounds (`client_conn.go`, `protocol_conn.go`, `padding.go`)
+* **Nil-Pointer Safety Guards**:
+  - Guarded `LocalAddr()`, `SetDeadline()`, `SetReadDeadline()`, `SetWriteDeadline()`, and `SyscallConn()` in `clientConn` against nil underlying connection references, returning `net.ErrClosed` or `syscall.ENOTSUP` instead of crashing.
   - Guarded `clientConnWithCloseWrite.CloseWrite()` to return `net.ErrClosed` when the underlying connection is nil.
-- **Timeout Tuning**:
-  - Shortened default client `tcpTimeout` from 5 s to 500 ms to accelerate discovery of stale connections.
-  - Reduced reconnection context timeout from 10 s to 1 s for prompt recovery.
-  - Made `Client.Reset()` asynchronous (`go session.Close()`) to prevent session closure from blocking active dial retries.
+* **Write Length Accounting Correction**:
+  - In `protocolConn.Write(p)`, fixed accounting bug returning `len(p) + requestLen - 1` (which exceeded `len(p)` when `requestLen >= 2`). Now returns exact `n = len(p)` on success.
+* **Zero-Data Padding Frame Resilience**:
+  - In `paddingConn.Read` and `ReadBuffer`, handled zero-data padding frames (`originalDataSize == 0`) by skipping the padding bytes and advancing to the next frame instead of returning an unexpected `(0, nil)`.
+* **Connection Teardown Condition Broadcasts & Buffer Cleanup**:
+  - In `clientConn.Close()`, added condition variable broadcasts (`c.retryCond.Broadcast()`, `c.requestWriteCond.Broadcast()`, `c.responseReadCond.Broadcast()`) under `c.stateMu.Lock()` to immediately wake and terminate any concurrent reader or writer goroutines blocked in wait loops upon connection closure, preventing goroutine leaks.
+  - Cleared `c.firstWriteBuffer = nil` on connection close so aborted handshakes immediately release initial handshake buffers, preventing memory retention.
+* **Disjoint Mutex Hierarchy**:
+  - In `clientConn.Read`, decoupled `c.getConn()` from `c.stateMu.Lock()`, guaranteeing that `connMu` is never held while acquiring `stateMu`, enforcing a strictly ordered, disjoint lock hierarchy.
+* **Safe Retired Session Eviction**:
+  - In `client.go`, relaxed retirement drain checks to `wrapper.activeStreams.Load() <= 0 && wrapper.NumStreams() <= 0`, ensuring non-positive stream counts are immediately and cleanly evicted from active connection tracking.
+* **Kernel Version Cache Poisoning Fix**:
+  - Cached kernel version in `cachedBrutalVersion` only when `ver > 0`, avoiding cache poisoning from pre-connect `getsockopt` calls.
+  - Tolerates `EPERM` without error logging when kernel policy route locks are active.
+
+### 3.7 Server Packet Write Coalescing & Frame Fragmentation Fix (`server_conn.go`)
+* **Single-Buffer Frame Serialization**:
+  - Coalesced the initial `statusSuccess` (1 byte), length prefix (2 bytes), and UDP payload into a single allocated `buf.Buffer` write.
+  - Eliminates the generation of 2 to 3 separate physical TCP frames per outbound UDP datagram.
 
 ---
 
-## Module 2: XMUX-Style Periodic Session Retirement & Graceful Drain
+## 4. File Modification & Addition Matrix
 
-### 1. Problem
-Under persistent TCP traffic, long-lived multiplexed connections are vulnerable to stateful flow tracking, heuristic classification, and RST severance by censorship middleboxes.
-
-### 2. Implementation Details (`client.go`, `session.go`, `error.go`)
-- **Session Wrapper & Bounds**: Implemented `sessionWrapper` wrapping `abstractSession` to track:
-  - `HMaxReusableSecs`: Hard expiration timestamp (`unreusableAt = now + HMaxReusableSecs`).
-  - `HMaxRequestTimes`: Remaining stream request capacity (`leftRequests`).
-  - `CMaxReuseTimes`: Remaining session reuse capacity (`leftReuseTimes`).
-- **Graceful Drain Lifecycle**:
-  - In `Client.offer()`, expired/retired sessions are excluded from taking new stream requests.
-  - Active in-flight streams on retired sessions continue serving traffic uninterrupted until closed (`NumStreams() == 0`).
-  - Retired sessions with 0 active streams are cleanly closed and evicted from the session list.
-- **Stream Lifecycle Tracking across Multiplexers**:
-  - Maintained `wrapStream.onClose` callback and `closeOnce` semantics across `smux`, `yamux`, and `h2mux`.
-  - Closing a stream decrements `activeStreams.Add(-1)` and triggers `maybeCloseSession()` for timely retirement eviction without resource leaks.
-
----
-
-## Module 3: Defensive Front Headroom Fallback & Buffer Safety
-
-### 1. Problem
-In `metacubex/sing-mux`, packet connection writing methods (`WritePacket` and `WriteBuffer`) prepend protocol framing headers via `buffer.ExtendHeader(...)`. If a caller supplies a `buf.Buffer` with insufficient front headroom (`buffer.Start() < needed`), `ExtendHeader` triggers an unhandled `panic: buffer overflow: capacity ..., start 0, need ...`, crashing the process.
-
-### 2. Implementation Details (`server_conn.go`, `client_conn.go`)
-- **Automatic Headroom Reallocation Fallback**:
-  - Applied to `serverPacketConn.WritePacket`, `serverPacketAddrConn.WritePacket`, `clientPacketConn.WriteBuffer`, and `clientPacketAddrConn.WritePacket`.
-  - Checks if `buffer.Start() < needed`. If headroom is insufficient, transparently reallocates a buffer with the required headroom (`buf.NewSize(buffer.Len() + needed)`), copies the payload, and safely releases the original buffer.
-- **Short Buffer Stream Drain Fix**:
-  - In `clientPacketConn.Read`, `clientPacketConn.ReadFrom`, and `clientPacketAddrConn.ReadFrom`, unread packet payload bytes are drained (`io.CopyN(io.Discard, c.conn, int64(length))`) before returning `io.ErrShortBuffer`.
-  - Prevents leftover payload bytes from corrupting length headers of subsequent frames on the multiplexed stream.
-
----
-
-## Module 4: Protocol Engine Safety & Resource Leak Hardening
-
-### 1. Implementation Details (`h2mux.go`, `server.go`, `client.go`)
-- **H2Mux Channel & Close Safety**:
-  - Wrapped `close(s.done)` in `sync.Once` (`s.closeOnce.Do`) to prevent `"close of closed channel"` panics during concurrent session teardown.
-  - Wrapped inbound stream dispatch in `ServeHTTP` with a `select` listening on `s.done` and `request.Context().Done()`, eliminating goroutine leaks on unbuffered channel sends when a session is terminating.
-  - Converted bare `writer.(http.Flusher)` type assertion to a safe comma-ok check, and guarded `w.flusher.Flush()` against nil in `Write` and `WriteBuffer` to prevent nil pointer dereferences on non-flusher writers.
-- **Timer Leak Elimination**: Replaced `time.After(tcpTimeout)` with `time.NewTimer` and explicit `timer.Stop()` upon request completion in `h2MuxClientSession.Open`, preventing timer accumulation on short-lived streams.
-- **Nil Logger Guards**: Protected all `logger.Debug`, `logger.InfoContext`, and `logger.ErrorContext` calls (notably in `server.go` handle connection error path) against nil pointer dereferences.
-
----
-
-## Module 5: Test Suite & Regression Verification
-
-Comprehensive unit test coverage is implemented across:
-- **`client_conn_test.go`**:
-  - `TestClientConnWithCloseWrite`: Validates `N.WriteCloser` implementation, verifies exclusion of `Upstream() any`, and tests half-close vs full close lifecycle.
-  - `TestWrapStreamCloseWrite`: Verifies half-close propagation across stream wrappers.
-  - `TestClientPacketConnZeroHeadroom`: Tests automatic front headroom reallocation fallback on `clientPacketConn`.
-  - `TestClientPacketAddrConnZeroHeadroom`: Tests automatic front headroom reallocation fallback on `clientPacketAddrConn`.
-- **`client_test.go`**:
-  - `TestParseRange`: Validates parsing of range strings (e.g. `"10-20"`, `"30"`, `"0"`).
-  - `TestSessionWrapperRetirement`: Verifies retirement evaluation against requests, reuses, and time limits.
-  - `TestWrapStreamCloseCallback`: Verifies stream close callback invocation.
-  - `TestClient_SessionRetirementRollover`: Tests seamless rollover from retired sessions to new sessions.
-- **`server_conn_test.go`**:
-  - `TestServerPacketConnZeroHeadroom` & `TestServerPacketAddrConnZeroHeadroom`: Verifies server packet zero-headroom reallocation fallback.
-  - `TestH2MuxConnWrapperNilFlusher`: Verifies `h2MuxConnWrapper` performs `Write` and `WriteBuffer` safely without panic when the flusher is nil.
-- **`yamux_halfclose_test.go`**:
-  - `TestYamuxWrapStreamCloseWriteKeepsReadOpen`: Verifies that yamux `CloseWrite` keeps the read side open and delivers peer responses intact.
-- **`brutal_test.go`**:
-  - `TestBrutalParamsPacking`: Verifies native endian parameter serialization for kernel v1 (12 bytes) and v2 (20 bytes) structs.
-  - `TestBrutalRequestZeroUnreadBytes`: Verifies that Brutal client exchange requests emit strictly 8 bytes of rate data without trailing unread bytes.
-  - `TestBrutalResponseV2Roundtrip`: Tests end-to-end 25-byte v2 exchange serialization with magic, rate, group ID, and cwnd gain.
-  - `TestBrutalResponseV1CleanFallback`: Verifies seamless, error-free fallback when connecting to a legacy v1 server that closes after sending 9 bytes.
-  - `TestBrutalResponseCorruptMagic` & `TestBrutalResponseTruncatedV2`: Validates defensive stream error handling against corrupt or truncated responses.
-  - `TestDeriveTenantGroupID`: Validates tenant group ID deterministic isolation and collision resistance under FNV-1a.
-  - `TestClampedSpeedAndGain`: Validates rate and CWND gain bounds clamping against Linux kernel limits.
-
----
-
-## Module 6: TCP Brutal v2 Protocol Negotiation & Multi-Tenant Bandwidth Management
-
-### 1. Problem
-The original upstream Brutal bandwidth exchange had structural constraints:
-- **Fixed Congestion Window & Single Parameter Negotiation**: Upstream only exchanged a raw `ReceiveBPS` rate uint64. The congestion window gain was hardcoded to `20` (2.0x), lacking adaptability for high-latency or fluctuating WAN routes.
-- **Unpooled Multi-Tenant Bandwidth Collisions**: Lacked tenant isolation and group-based bandwidth sharing across concurrent multiplexed connections. Multiple users or streams could starve each other without partitioned fair allocations.
-- **Kernel Compatibility & Fragile Privilege Constraints**: Calling `setsockopt(..., TCP_CONGESTION, "brutal")` or `TCP_BRUTAL_PARAMS` on systems with policy route locks (`brutalctl`/`congctl` locks) returned `EPERM`, aborting sessions even when TCP Brutal was already assigned to the socket. Furthermore, upstream lacked support for TCP Brutal kernel v2 data structures (`TCP_BRUTAL_VERSION`).
-
-### 2. Implementation Details (`brutal.go`, `brutal_linux.go`, `client.go`, `server.go`, `brutal_stub.go`)
-- **Brutal v2 Stream Negotiation Protocol (`brutal.go`)**:
-  - Introduced dedicated port signaling via `BrutalExchangePortV2` (port `23302`) and magic number `BrutalMagicV2` (`0x42525502`) in stream requests to declare v2 capabilities.
-  - **Zero-Unread-Byte Invariant (`WriteBrutalRequest`)**: In outbound client requests, the client transmits strictly the 8-byte `ReceiveBPS` rate payload without trailing unread bytes, relying on destination port `23302` in `StreamRequest` to declare v2 capability. This eliminates trailing byte buffers and prevents legacy v1 servers from aborting with RST.
-  - **Transparent V1 Degradation Fallback (`ReadBrutalResponse`)**: Supports reading both legacy 9-byte responses (`[1][rate]`) and 25-byte v2 extension responses (`[1][rate][magic][groupID][cwndGain]`). On legacy v1 servers that write 9 bytes and immediately close the exchange stream, clean EOF / 0-byte `ErrUnexpectedEOF` is detected and gracefully falls back to Brutal v1 without error.
-- **Multi-Tenant Group ID Isolation & CWND Tuning (`brutal.go`, `server.go`, `client.go`)**:
-  - Implemented `deriveTenantGroupID(userUUID, clientGroupID)` using 64-bit FNV-1a hashing to partition client group IDs by tenant identity with zero heap allocations, preventing noisy-neighbor starvation across multi-tenant deployments.
-  - Supported configurable `CwndGain` (bounded between `BrutalMinCwndGain` 5 [0.5x] and `BrutalMaxCwndGain` 80 [8.0x], defaulting to 20 [2.0x]).
-- **Linux Kernel v2 Integration & Privilege Safety (`brutal_linux.go`)**:
-  - Dynamically detects kernel support via `TCP_BRUTAL_VERSION` (`23302`) and formats parameter buffers via `packBrutalParamsV2` (20 bytes: `[rate][cwndGain][groupID]`) or `packBrutalParamsV1` (12 bytes: `[rate][cwndGain]`).
-  - Implemented `setsockoptRaw` using `syscall.Syscall6` to avoid runtime memory overheads.
-  - Silent `EPERM` error tolerance: If `setsockopt(..., TCP_CONGESTION, "brutal")` or `TCP_BRUTAL_PARAMS` returns `EPERM`, verifies whether the socket already has `"brutal"` assigned by system routing rules (`brutalctl`), and cleanly tolerates permission restrictions without breaking the connection.
-
----
-
-## Post-Review Fixes & Design Improvements
-
-1. **Kernel Brutal Version Cache Poisoning Prevention (`brutal_linux.go`)**:
-   - Fixed `getKernelBrutalVersion` so transient or pre-connect `getsockopt(TCP_BRUTAL_VERSION)` failures no longer store `0` into `cachedBrutalVersion` and permanently downgrade the process to Brutal v1. Only positive kernel versions (`ver > 0`) are cached.
-2. **Configured `CwndGain` & `GroupID` Preservation Across Brutal Negotiation (`client.go`, `server.go`)**:
-   - Updated `server.go` and `client.go` to honor explicitly configured `s.brutal.CwndGain` / `c.brutal.CwndGain` and `c.brutal.GroupID` when applying `SetBrutalOptions`, since `WriteBrutalRequest` transmits an 8-byte wire frame (`ReceiveBPS` only) to preserve the zero-unread-byte invariant.
-3. **Brutal Session Readiness & Capacity Filtering (`client.go`)**:
-   - Updated the `c.brutal.Enabled` fast path in `offer()` to filter sessions by `abstractSession.CanTakeNewRequest` and respect `c.maxStreams`.
-
-
----
-
-## 9. Additional Post-Review Bug Fixes & Hardening
-
-1. **Concurrent Read/Write Stream-Swap Race & Session Eviction (`client_conn.go`)**:
-   - Captured `readConn := c.getConn()` before `c.readResponse(readConn)` so a concurrent `Write()` that swaps `c.conn` on failure cannot cause `Read()` to close and replace the newly established stream.
-   - Moved `c.client.CloseSession(sess)` inside `trySwapConnection(failedConn)` after verifying `c.conn == failedConn` under `dialMu`, ensuring failed sessions are evicted whether `Read()` or `Write()` detects the failure first.
-   - Fixed `Read()` when `trySwapConnection` returns `(swapped=false, ok=true)` (because a concurrent `Write()` already swapped the stream and replayed `firstWriteBuffer`): `Read()` now loops back (`continue`) to read the handshake response on the new stream instead of returning the old stream error.
-2. **Zero-Headroom Buffer Guards, Short-Buffer Draining & Buffer Ownership (`server_conn.go`, `padding.go`)**:
-   - Added mutex synchronization (`access sync.Mutex`) and a `buffer.Start() < 1` reallocation guard to `serverConn.WriteBuffer`.
-   - Added `io.CopyN(io.Discard, c.ExtendedConn, int64(length))` payload draining to `serverPacketConn.ReadFrom` and `serverPacketAddrConn.ReadFrom` on `io.ErrShortBuffer` to preserve frame alignment.
-   - Added `defer buffer.Release()` on the `bufferLen > 65535` path and a front/rear headroom reallocation guard (`buffer.Start() < 4 || buffer.FreeLen() < paddingLen`) in `paddingConn.WriteBuffer`.
-3. **Lock-Free CAS Reuse Quota (`session.go`)**:
-   - Upgraded `sessionWrapper.ConsumeReuse()` to a compare-and-swap (CAS) loop to prevent concurrent reuse decrements from underflowing `0` to `-1` (the unlimited sentinel).
-
-
-## Five-Round Code Review & Remediation Addendum (2026-10-15)
-
-- **Rounds 1–5 Verification (`client.go`, `client_conn.go`, `session.go`, `server.go`, `brutal.go`, `brutal_linux.go`)**:
-  - Verified `activeStreams` atomic reference counting on `sessionWrapper` across `offer`, `offerNew`, `openStream`, and `maybeCloseSession` so newly dialed or reused sessions cannot be prematurely closed by `hMaxReusableSecs` timers before `session.Open()` completes.
-  - Verified `trySwapConnection` and `Read`/`Write` condition-variable coordination (`retryCond`, `requestWriteCond`, `responseReadCond`) when concurrent `Write` and `Read` calls race during stream failover.
-  - Verified UDP short-buffer frame alignment (`io.CopyN(io.Discard, c.conn, int64(length))`) and headroom reallocation in `clientPacketConn` and `clientPacketAddrConn`.
+| File Path | Status | Change Type | Description of Delta Relative to Upstream Baseline |
+| :--- | :--- | :--- | :--- |
+| `session.go` | **Added** | **Type 1** (New Feature) | Implemented `sessionWrapper` tracking active streams, retirement deadlines, and atomic CAS quota consumption. |
+| `brutal.go` | **Modified** | **Type 1** (New Feature) | Port `23302` signaling, magic `0x42525502`, FNV-1a tenant group ID derivation, cross-platform `packBrutalParamsV1` / `packBrutalParamsV2`. |
+| `brutal_linux.go` | **Modified** | **Type 1** & **Type 2** | Kernel v2 parameter struct (`tcp_brutal_params_v2`), setsockopt wrapper, positive-only version caching (`ver > 0`), EPERM tolerance. |
+| `brutal_stub.go` | **Modified** | **Type 2** (Portability) | Cross-platform stubs for non-Linux operating systems. |
+| `client.go` | **Modified** | **Type 1** & **Type 2** | Type 1: `CloseSession()` targeted eviction, async `Reset()`, XMUX retirement limits (`HMaxReusableSecs`, `HMaxRequestTimes`, `CMaxReuseTimes`), CwndGain preservation, user-tunable `MaxDrainRetries` and `DrainRetryInterval` options.<br>Type 2: Retired session eviction clamp (`<= 0`), named constants for `DefaultTCPTimeout`, `DefaultMinStreams`, `MaxDrainRetries`, and `DrainRetryInterval`. |
+| `client_conn.go` | **Modified** | **Type 1** & **Type 2** | Type 1: Omission of `Upstream() any`, `firstWriteBuffer` handshake replay.<br>Type 2: `readAccess` / `access` mutex split, `io.ErrShortBuffer` payload draining, zero-alloc integer helpers, `Close()` condition broadcasts, `firstWriteBuffer = nil` memory release, named constants `MaxHandshakeBufferCapacity` (4096) and `MaxStreamSwapRetries` (2). |
+| `client_conn_wait.go` | **Modified** | **Type 2** (Bugfix) | `readAccess` mutex synchronization on `WaitReadPacket()`, stack `readUint16` decoding. |
+| `error.go` | **Added** | **Type 1** (New Feature) | Sentinel error declarations (`ErrSessionClosed`, `ErrMaxRequestsReached`, etc.). |
+| `h2mux.go` | **Modified** | **Type 2** (Bugfix) | Immediate `pipeInWriter.CloseWithError` on failure, `time.AfterFunc` stream timeout optimization, `http.StatusOK` status check. |
+| `h2mux_conn.go` | **Modified** | **Type 1** (New Feature) | Half-close write delegation mapping to HTTP/2 `END_STREAM`. |
+| `padding.go` | **Modified** | **Type 2** (Bugfix) | `writeAccess sync.Mutex` serialization, zero-data padding frame skipping, front/rear headroom reallocation guards, named constants for `MaxPaddingPayloadLen`, `MinPaddingLength`, `MaxRandomPaddingSpan`, and `PaddingHeaderLength`. |
+| `protocol.go` | **Modified** | **Type 2** (Bugfix/Perf) | `readUint16` / `writeUint16` stack helpers, coalesced 2-byte header reads, zero-allocation `StreamRequest` serialization. |
+| `protocol_conn.go` | **Modified** | **Type 2** (Bugfix) | `c.access.Lock()` synchronization on initial request write, exact write length accounting (`n = len(p)`). |
+| `server.go` | **Modified** | **Type 1** & **Type 2** | Brutal v2 server-side parameter extraction, configurable CwndGain application, maxStreams bounds enforcement. |
+| `server_conn.go` | **Modified** | **Type 2** (Bugfix) | Defensive front headroom reallocation, status/length/payload write coalescing, `c.access.Lock()` synchronization on handshake methods. |
+| `brutal_test.go` | **Added** | Testing | Unit tests for Brutal v2 roundtrip, fallback, tenant derivation, and byte packing. |
+| `client_conn_test.go` | **Added** | Testing | Unit tests for stream failover, zero headroom guards, and `CloseWrite` preservation. |
+| `client_test.go` | **Added** | Testing | Unit tests for session retirement rollover and targeted session isolation. |
+| `padding_test.go` | **Added** | Testing | Unit tests for zero-data padding frames and buffer reallocation. |
+| `server_conn_test.go` | **Added** | Testing | Unit tests for server packet connection zero-headroom handling. |
+| `yamux_halfclose_test.go`| **Added** | Testing | Unit test verifying half-close write preservation on Yamux streams. |

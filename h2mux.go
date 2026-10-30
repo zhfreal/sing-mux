@@ -219,25 +219,18 @@ func (s *h2MuxClientSession) Open(tcpTimeout time.Duration) (net.Conn, error) {
 	connCtx, cancel := context.WithCancel(context.Background())
 	request = request.WithContext(connCtx)
 	conn := newLateHTTPConn(pipeInWriter, cancel)
-	requestDone := make(chan struct{})
-	timer := time.NewTimer(tcpTimeout)
-	go func() {
-		select {
-		case <-requestDone:
-			timer.Stop()
-			return
-		case <-timer.C:
-			cancel()
-		}
-	}()
+	timer := time.AfterFunc(tcpTimeout, cancel)
 	go func() {
 		response, err := s.transport.RoundTrip(request)
-		close(requestDone)
+		timer.Stop()
 		if err != nil {
+			_ = pipeInWriter.CloseWithError(err)
 			conn.setup(nil, err)
-		} else if response.StatusCode != 200 {
+		} else if response.StatusCode != http.StatusOK {
 			response.Body.Close()
-			conn.setup(nil, E.New("unexpected status: ", response.StatusCode, " ", response.Status))
+			statusErr := E.New("unexpected status: ", response.StatusCode, " ", response.Status)
+			_ = pipeInWriter.CloseWithError(statusErr)
+			conn.setup(nil, statusErr)
 		} else {
 			conn.setup(response.Body, nil)
 		}
