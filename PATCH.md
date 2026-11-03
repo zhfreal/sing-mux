@@ -121,11 +121,14 @@ The modifications are structured into two distinct categories:
   - Cached kernel version in `cachedBrutalVersion` only when `ver > 0`, avoiding cache poisoning from pre-connect `getsockopt` calls.
   - Tolerates `EPERM` without error logging when kernel policy route locks are active.
 
-### 3.7 Server Packet Write Coalescing & Frame Fragmentation Fix (`server_conn.go`)
+### 3.7 Packet Write Coalescing & Frame Fragmentation Fix (`client_conn.go`, `server_conn.go`, `protocol_conn.go`)
 * **Single-Buffer Frame Serialization**:
-  - Coalesced the initial `statusSuccess` (1 byte), destination address (for address-aware packets), length prefix (2 bytes), and UDP payload into a single allocated `buf.Buffer` write across both `serverPacketConn.WriteTo` and `serverPacketAddrConn.WriteTo`.
-  - Eliminates the generation of 2 to 4 separate physical TCP frames per outbound UDP datagram.
-  - Added defensive `buffer.Release()` on `serverPacketAddrConn.WritePacket` header serialization errors.
+  - Coalesced length prefix (2 bytes) and payload into a single allocated `buf.Buffer` write across `clientPacketConn.Write`.
+  - Coalesced destination address, length prefix (2 bytes), and UDP payload into a single allocated `buf.Buffer` write across both `clientPacketAddrConn.WriteTo` and `serverPacketAddrConn.WriteTo`.
+  - Coalesced the initial `statusSuccess` (1 byte), length prefix (2 bytes), and UDP payload into a single allocated `buf.Buffer` write in `serverPacketConn.WriteTo`.
+  - Eliminates the generation of 2 to 4 separate physical TCP frames per outbound and inbound UDP datagram.
+  - Added defensive `buffer.Release()` on `clientPacketAddrConn.WritePacket` and `serverPacketAddrConn.WritePacket` header serialization errors.
+  - Pre-allocated vectorised buffers in `protocol_conn.go` and `padding.go` to eliminate intermediate slice reallocations on frame writes.
 
 ---
 
@@ -138,14 +141,14 @@ The modifications are structured into two distinct categories:
 | `brutal_linux.go` | **Modified** | **Type 1** & **Type 2** | Kernel v2 parameter struct (`tcp_brutal_params_v2`), setsockopt wrapper, positive-only version caching (`ver > 0`), EPERM tolerance. |
 | `brutal_stub.go` | **Modified** | **Type 2** (Portability) | Cross-platform stubs for non-Linux operating systems. |
 | `client.go` | **Modified** | **Type 1** & **Type 2** | Type 1: `CloseSession()` targeted eviction, async `Reset()`, XMUX retirement limits (`HMaxReusableSecs`, `HMaxRequestTimes`, `CMaxReuseTimes`), CwndGain preservation, user-tunable `MaxDrainRetries`, `DrainRetryInterval`, and `MaxStreamSwapRetries` options.<br>Type 2: Retired session eviction clamp (`<= 0`), named constants for `DefaultTCPTimeout`, `DefaultMinStreams`, `MaxDrainRetries`, and `DrainRetryInterval`. |
-| `client_conn.go` | **Modified** | **Type 1** & **Type 2** | Type 1: Omission of `Upstream() any`, `firstWriteBuffer` handshake replay.<br>Type 2: `readAccess` / `access` mutex split, `io.ErrShortBuffer` payload draining, zero-alloc integer helpers, `Close()` condition broadcasts, `firstWriteBuffer = nil` memory release, named constants `MaxHandshakeBufferCapacity` (4096), `MaxStreamSwapRetries` (2), and `StreamSwapDialTimeout` (1s), with dynamic retrieval via `c.getMaxStreamSwapRetries()`. |
+| `client_conn.go` | **Modified** | **Type 1** & **Type 2** | Type 1: Omission of `Upstream() any`, `firstWriteBuffer` handshake replay.<br>Type 2: `readAccess` / `access` mutex split, `io.ErrShortBuffer` payload draining, zero-alloc integer helpers, `Close()` condition broadcasts, `firstWriteBuffer = nil` memory release, length/address/payload single-buffer write coalescing, defensive `buffer.Release()` on `WritePacket` error, named constants `MaxHandshakeBufferCapacity` (4096), `MaxStreamSwapRetries` (2), and `StreamSwapDialTimeout` (1s), with dynamic retrieval via `c.getMaxStreamSwapRetries()`. |
 | `client_conn_wait.go` | **Modified** | **Type 2** (Bugfix) | `readAccess` mutex synchronization on `WaitReadPacket()`, stack `readUint16` decoding. |
 | `error.go` | **Added** | **Type 1** (New Feature) | Sentinel error declarations (`ErrSessionClosed`, `ErrMaxRequestsReached`, etc.). |
 | `h2mux.go` | **Modified** | **Type 2** (Bugfix) | Immediate `pipeInWriter.CloseWithError` on failure, `time.AfterFunc` stream timeout optimization, `http.StatusOK` status check, and `request.Context().Done()` leak mitigation. |
 | `h2mux_conn.go` | **Modified** | **Type 1** (New Feature) | Half-close write delegation mapping to HTTP/2 `END_STREAM`. |
 | `padding.go` | **Modified** | **Type 2** (Bugfix) | `writeAccess sync.Mutex` serialization, zero-data padding frame skipping, front/rear headroom reallocation guards, single-allocation vectorised slice assembly, named constants for `MaxPaddingPayloadLen`, `MinPaddingLength`, `MaxRandomPaddingSpan`, and `PaddingHeaderLength`. |
 | `protocol.go` | **Modified** | **Type 2** (Bugfix/Perf) | `readUint16` / `writeUint16` stack helpers, coalesced 2-byte header reads, zero-allocation `StreamRequest` serialization. |
-| `protocol_conn.go` | **Modified** | **Type 2** (Bugfix) | `c.access.Lock()` synchronization on initial request write, exact write length accounting (`n = len(p)`). |
+| `protocol_conn.go` | **Modified** | **Type 2** (Bugfix) | `c.access.Lock()` synchronization on initial request write, exact write length accounting (`n = len(p)`), and single-allocation vectorised assembly. |
 | `server.go` | **Modified** | **Type 1** & **Type 2** | Brutal v2 server-side parameter extraction, configurable CwndGain application, maxStreams bounds enforcement, and stream error teardown leak fix. |
 | `server_conn.go` | **Modified** | **Type 2** (Bugfix) | Defensive front headroom reallocation, status/addr/length/payload write coalescing, `c.access.Lock()` synchronization on handshake methods, and buffer leak prevention on packet write failure. |
 | `brutal_test.go` | **Added** | Testing | Unit tests for Brutal v2 roundtrip, fallback, tenant derivation, and byte packing. |
