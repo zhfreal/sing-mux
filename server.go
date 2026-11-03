@@ -92,6 +92,7 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 	}
 	request, err := ReadStreamRequest(stream)
 	if err != nil {
+		_ = stream.Close()
 		return E.Cause(err, "read multiplex stream request")
 	}
 	metadata.Destination = request.Destination

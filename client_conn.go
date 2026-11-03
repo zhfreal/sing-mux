@@ -235,6 +235,7 @@ func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 			c.firstWriteBuffer = append(c.firstWriteBuffer, b...)
 		} else {
 			c.client = nil
+			c.firstWriteBuffer = nil
 		}
 	}
 	c.stateMu.Unlock()

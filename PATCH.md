@@ -108,7 +108,11 @@ The modifications are structured into two distinct categories:
   - In `paddingConn.Read` and `ReadBuffer`, handled zero-data padding frames (`originalDataSize == 0`) by skipping the padding bytes and advancing to the next frame instead of returning an unexpected `(0, nil)`.
 * **Connection Teardown Condition Broadcasts & Buffer Cleanup**:
   - In `clientConn.Close()`, added condition variable broadcasts (`c.retryCond.Broadcast()`, `c.requestWriteCond.Broadcast()`, `c.responseReadCond.Broadcast()`) under `c.stateMu.Lock()` to immediately wake and terminate any concurrent reader or writer goroutines blocked in wait loops upon connection closure, preventing goroutine leaks.
-  - Cleared `c.firstWriteBuffer = nil` on connection close so aborted handshakes immediately release initial handshake buffers, preventing memory retention.
+  - Cleared `c.firstWriteBuffer = nil` immediately when write payload exceeds `MaxHandshakeBufferCapacity` or upon connection close, preventing memory retention on long-lived or aborted connections.
+* **HTTP/2 Request Context Teardown**:
+  - In `h2MuxServerSession.ServeHTTP`, added `case <-request.Context().Done(): _ = conn.Close()` in the teardown select, ensuring client-aborted streams promptly unblock `ServeHTTP` and decrement active stream tracking.
+* **Inbound Stream Error Teardown**:
+  - In `server.go`, added immediate `stream.Close()` when `ReadStreamRequest` returns an error, preventing orphaned streams and stream counter leaks on malformed handshakes.
 * **Disjoint Mutex Hierarchy**:
   - In `clientConn.Read`, decoupled `c.getConn()` from `c.stateMu.Lock()`, guaranteeing that `connMu` is never held while acquiring `stateMu`, enforcing a strictly ordered, disjoint lock hierarchy.
 * **Safe Retired Session Eviction**:
@@ -119,8 +123,9 @@ The modifications are structured into two distinct categories:
 
 ### 3.7 Server Packet Write Coalescing & Frame Fragmentation Fix (`server_conn.go`)
 * **Single-Buffer Frame Serialization**:
-  - Coalesced the initial `statusSuccess` (1 byte), length prefix (2 bytes), and UDP payload into a single allocated `buf.Buffer` write.
-  - Eliminates the generation of 2 to 3 separate physical TCP frames per outbound UDP datagram.
+  - Coalesced the initial `statusSuccess` (1 byte), destination address (for address-aware packets), length prefix (2 bytes), and UDP payload into a single allocated `buf.Buffer` write across both `serverPacketConn.WriteTo` and `serverPacketAddrConn.WriteTo`.
+  - Eliminates the generation of 2 to 4 separate physical TCP frames per outbound UDP datagram.
+  - Added defensive `buffer.Release()` on `serverPacketAddrConn.WritePacket` header serialization errors.
 
 ---
 
@@ -136,13 +141,13 @@ The modifications are structured into two distinct categories:
 | `client_conn.go` | **Modified** | **Type 1** & **Type 2** | Type 1: Omission of `Upstream() any`, `firstWriteBuffer` handshake replay.<br>Type 2: `readAccess` / `access` mutex split, `io.ErrShortBuffer` payload draining, zero-alloc integer helpers, `Close()` condition broadcasts, `firstWriteBuffer = nil` memory release, named constants `MaxHandshakeBufferCapacity` (4096), `MaxStreamSwapRetries` (2), and `StreamSwapDialTimeout` (1s), with dynamic retrieval via `c.getMaxStreamSwapRetries()`. |
 | `client_conn_wait.go` | **Modified** | **Type 2** (Bugfix) | `readAccess` mutex synchronization on `WaitReadPacket()`, stack `readUint16` decoding. |
 | `error.go` | **Added** | **Type 1** (New Feature) | Sentinel error declarations (`ErrSessionClosed`, `ErrMaxRequestsReached`, etc.). |
-| `h2mux.go` | **Modified** | **Type 2** (Bugfix) | Immediate `pipeInWriter.CloseWithError` on failure, `time.AfterFunc` stream timeout optimization, `http.StatusOK` status check. |
+| `h2mux.go` | **Modified** | **Type 2** (Bugfix) | Immediate `pipeInWriter.CloseWithError` on failure, `time.AfterFunc` stream timeout optimization, `http.StatusOK` status check, and `request.Context().Done()` leak mitigation. |
 | `h2mux_conn.go` | **Modified** | **Type 1** (New Feature) | Half-close write delegation mapping to HTTP/2 `END_STREAM`. |
-| `padding.go` | **Modified** | **Type 2** (Bugfix) | `writeAccess sync.Mutex` serialization, zero-data padding frame skipping, front/rear headroom reallocation guards, named constants for `MaxPaddingPayloadLen`, `MinPaddingLength`, `MaxRandomPaddingSpan`, and `PaddingHeaderLength`. |
+| `padding.go` | **Modified** | **Type 2** (Bugfix) | `writeAccess sync.Mutex` serialization, zero-data padding frame skipping, front/rear headroom reallocation guards, single-allocation vectorised slice assembly, named constants for `MaxPaddingPayloadLen`, `MinPaddingLength`, `MaxRandomPaddingSpan`, and `PaddingHeaderLength`. |
 | `protocol.go` | **Modified** | **Type 2** (Bugfix/Perf) | `readUint16` / `writeUint16` stack helpers, coalesced 2-byte header reads, zero-allocation `StreamRequest` serialization. |
 | `protocol_conn.go` | **Modified** | **Type 2** (Bugfix) | `c.access.Lock()` synchronization on initial request write, exact write length accounting (`n = len(p)`). |
-| `server.go` | **Modified** | **Type 1** & **Type 2** | Brutal v2 server-side parameter extraction, configurable CwndGain application, maxStreams bounds enforcement. |
-| `server_conn.go` | **Modified** | **Type 2** (Bugfix) | Defensive front headroom reallocation, status/length/payload write coalescing, `c.access.Lock()` synchronization on handshake methods. |
+| `server.go` | **Modified** | **Type 1** & **Type 2** | Brutal v2 server-side parameter extraction, configurable CwndGain application, maxStreams bounds enforcement, and stream error teardown leak fix. |
+| `server_conn.go` | **Modified** | **Type 2** (Bugfix) | Defensive front headroom reallocation, status/addr/length/payload write coalescing, `c.access.Lock()` synchronization on handshake methods, and buffer leak prevention on packet write failure. |
 | `brutal_test.go` | **Added** | Testing | Unit tests for Brutal v2 roundtrip, fallback, tenant derivation, and byte packing. |
 | `client_conn_test.go` | **Added** | Testing | Unit tests for stream failover, zero headroom guards, and `CloseWrite` preservation. |
 | `client_test.go` | **Added** | Testing | Unit tests for session retirement rollover and targeted session isolation. |

@@ -259,8 +259,11 @@ func (c *vectorisedPaddingConn) WriteVectorised(buffers []*buf.Buffer) error {
 		binary.BigEndian.PutUint16(hdrBytes[2:], uint16(paddingLen))
 		padding := buf.NewSize(paddingLen)
 		padding.Extend(paddingLen)
-		buffers = append(append([]*buf.Buffer{header}, buffers...), padding)
-		err := c.writer.WriteVectorised(buffers)
+		allBuffers := make([]*buf.Buffer, 0, len(buffers)+2)
+		allBuffers = append(allBuffers, header)
+		allBuffers = append(allBuffers, buffers...)
+		allBuffers = append(allBuffers, padding)
+		err := c.writer.WriteVectorised(allBuffers)
 		c.writeAccess.Unlock()
 		return err
 	}

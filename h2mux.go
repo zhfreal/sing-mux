@@ -74,6 +74,8 @@ func (s *h2MuxServerSession) ServeHTTP(writer http.ResponseWriter, request *http
 	case <-conn.done:
 	case <-s.done:
 		_ = conn.Close()
+	case <-request.Context().Done():
+		_ = conn.Close()
 	}
 }
 
