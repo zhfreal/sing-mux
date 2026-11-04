@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/sing/common/bufio"
@@ -177,4 +178,121 @@ func TestClientPacketAddrConnZeroHeadroom(t *testing.T) {
 		t.Fatalf("expected written bytes, got 0")
 	}
 }
+
+func TestClientConnClosedBehavior(t *testing.T) {
+	p1, p2 := net.Pipe()
+	defer p2.Close()
+
+	rawConn := &clientConn{
+		conn:        p1,
+		destination: M.ParseSocksaddr("127.0.0.1:80"),
+	}
+
+	// Close the connection
+	if err := rawConn.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Double close should succeed idempotently
+	if err := rawConn.Close(); err != nil {
+		t.Fatalf("Second Close failed: %v", err)
+	}
+
+	// Read on closed connection should return net.ErrClosed immediately
+	readBuf := make([]byte, 16)
+	n, err := rawConn.Read(readBuf)
+	if n != 0 || err != net.ErrClosed {
+		t.Fatalf("expected 0, net.ErrClosed on closed Read, got %d, %v", n, err)
+	}
+
+	// Write on closed connection should return net.ErrClosed immediately
+	n, err = rawConn.Write([]byte("test"))
+	if n != 0 || err != net.ErrClosed {
+		t.Fatalf("expected 0, net.ErrClosed on closed Write, got %d, %v", n, err)
+	}
+
+	// trySwapConnection on closed connection should return false, false without dialing
+	swapped, ok := rawConn.trySwapConnection(p1)
+	if swapped || ok {
+		t.Fatalf("expected false, false from trySwapConnection on closed conn, got %v, %v", swapped, ok)
+	}
+}
+
+func TestClientPacketConnCoalescedWriteTo(t *testing.T) {
+	out := &bytes.Buffer{}
+	extPipe := &mockExtendedPipe{writeBuf: out}
+	extConn := bufio.NewExtendedConn(extPipe)
+
+	cpc := &clientPacketConn{
+		conn:           extConn,
+		requestWritten: true,
+	}
+
+	payload := []byte("hello-udp-packet")
+	n, err := cpc.WriteTo(payload, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234})
+	if err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("expected n=%d, got %d", len(payload), n)
+	}
+
+	written := out.Bytes()
+	if len(written) != 2+len(payload) {
+		t.Fatalf("expected coalesced length %d, got %d", 2+len(payload), len(written))
+	}
+	// Check uint16 prefix
+	expectedLen := uint16(len(payload))
+	gotLen := uint16(written[0])<<8 | uint16(written[1])
+	if gotLen != expectedLen {
+		t.Fatalf("expected length prefix %d, got %d", expectedLen, gotLen)
+	}
+	if !bytes.Equal(written[2:], payload) {
+		t.Fatalf("payload mismatch: expected %q, got %q", payload, written[2:])
+	}
+}
+
+func TestClientTunablesAndClosedState(t *testing.T) {
+	client, err := NewClient(Options{
+		MaxHandshakeBufferCapacity: 8192,
+		StreamOpenRetries:          3,
+		H2MuxIdleTimeout:           15 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	if client.maxHandshakeBufferCapacity != 8192 {
+		t.Fatalf("expected maxHandshakeBufferCapacity=8192, got %d", client.maxHandshakeBufferCapacity)
+	}
+	if client.streamOpenRetries != 3 {
+		t.Fatalf("expected streamOpenRetries=3, got %d", client.streamOpenRetries)
+	}
+	if client.h2MuxIdleTimeout != 15*time.Second {
+		t.Fatalf("expected h2MuxIdleTimeout=15s, got %v", client.h2MuxIdleTimeout)
+	}
+
+	rawConn := &clientConn{
+		client: client,
+	}
+	if rawConn.getMaxHandshakeBufferCapacity() != 8192 {
+		t.Fatalf("expected rawConn to inherit 8192, got %d", rawConn.getMaxHandshakeBufferCapacity())
+	}
+
+	// Close the client and verify calls return net.ErrClosed
+	if err := client.Close(); err != nil {
+		t.Fatalf("client.Close failed: %v", err)
+	}
+
+	_, err = client.DialContext(context.Background(), "tcp", M.ParseSocksaddr("127.0.0.1:80"))
+	if err != net.ErrClosed {
+		t.Fatalf("expected net.ErrClosed on DialContext after close, got %v", err)
+	}
+
+	_, err = client.ListenPacket(context.Background(), M.ParseSocksaddr("127.0.0.1:80"))
+	if err != net.ErrClosed {
+		t.Fatalf("expected net.ErrClosed on ListenPacket after close, got %v", err)
+	}
+}
+
+
 

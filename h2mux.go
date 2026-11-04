@@ -20,7 +20,11 @@ import (
 	"golang.org/x/net/http2"
 )
 
-const idleTimeout = 30 * time.Second
+const (
+	DefaultH2MuxIdleTimeout = 30 * time.Second
+	H2MuxConnectScheme      = "https"
+	H2MuxConnectHost        = "localhost"
+)
 
 var _ abstractSession = (*h2MuxServerSession)(nil)
 
@@ -33,7 +37,10 @@ type h2MuxServerSession struct {
 	closeOnce sync.Once
 }
 
-func newH2MuxServer(conn net.Conn) *h2MuxServerSession {
+func newH2MuxServer(conn net.Conn, idleTimeout time.Duration) *h2MuxServerSession {
+	if idleTimeout <= 0 {
+		idleTimeout = DefaultH2MuxIdleTimeout
+	}
 	session := &h2MuxServerSession{
 		conn:    conn,
 		inbound: make(chan net.Conn),
@@ -183,7 +190,10 @@ type h2MuxClientSession struct {
 	closed     bool
 }
 
-func newH2MuxClient(conn net.Conn) (*h2MuxClientSession, error) {
+func newH2MuxClient(conn net.Conn, idleTimeout time.Duration) (*h2MuxClientSession, error) {
+	if idleTimeout <= 0 {
+		idleTimeout = DefaultH2MuxIdleTimeout
+	}
 	session := &h2MuxClientSession{
 		transport: &http2.Transport{
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
@@ -216,7 +226,7 @@ func (s *h2MuxClientSession) Open(tcpTimeout time.Duration) (net.Conn, error) {
 		Method: http.MethodConnect,
 		Body:   pipeInReader,
 		Header: make(http.Header),
-		URL:    &url.URL{Scheme: "https", Host: "localhost"},
+		URL:    &url.URL{Scheme: H2MuxConnectScheme, Host: H2MuxConnectHost},
 	}
 	connCtx, cancel := context.WithCancel(context.Background())
 	request = request.WithContext(connCtx)

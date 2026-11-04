@@ -15,12 +15,15 @@ import (
 )
 
 const (
-	kFirstPaddings       = 16
-	MaxPaddingPayloadLen = 65535
-	MinPaddingLength     = 256
-	MaxRandomPaddingSpan = 512
-	PaddingHeaderLength  = 4
-	MaxHeadroomPadding   = 1024
+	kFirstPaddings            = 16
+	MaxPaddingPayloadLen      = 65535
+	MinPaddingLength          = 256
+	MaxRandomPaddingSpan      = 512
+	PaddingHeaderLength       = 4
+	PaddingOriginalSizeLen    = 2
+	PaddingLengthFieldLen     = 2
+	MaxHeadroomPadding        = 1024
+	PaddingVectorExtraBuffers = 2
 )
 
 type paddingConn struct {
@@ -69,13 +72,13 @@ func (c *paddingConn) Read(p []byte) (n int, err error) {
 			c.paddingRemaining = 0
 		}
 		if c.readPadding < kFirstPaddings {
-			var paddingHdr [4]byte
+			var paddingHdr [PaddingHeaderLength]byte
 			_, err = io.ReadFull(c.ExtendedConn, paddingHdr[:])
 			if err != nil {
 				return
 			}
-			originalDataSize := int(binary.BigEndian.Uint16(paddingHdr[:2]))
-			paddingLen := int(binary.BigEndian.Uint16(paddingHdr[2:]))
+			originalDataSize := int(binary.BigEndian.Uint16(paddingHdr[:PaddingOriginalSizeLen]))
+			paddingLen := int(binary.BigEndian.Uint16(paddingHdr[PaddingOriginalSizeLen:]))
 			c.readPadding++
 			c.paddingRemaining = paddingLen
 
@@ -126,8 +129,8 @@ func (c *paddingConn) write(p []byte) (n int, err error) {
 		buffer := buf.NewSize(PaddingHeaderLength + len(p) + paddingLen)
 		defer buffer.Release()
 		header := buffer.Extend(PaddingHeaderLength)
-		binary.BigEndian.PutUint16(header[:2], uint16(len(p)))
-		binary.BigEndian.PutUint16(header[2:], uint16(paddingLen))
+		binary.BigEndian.PutUint16(header[:PaddingOriginalSizeLen], uint16(len(p)))
+		binary.BigEndian.PutUint16(header[PaddingOriginalSizeLen:], uint16(paddingLen))
 		common.Must1(buffer.Write(p))
 		buffer.Extend(paddingLen)
 		_, err = c.ExtendedConn.Write(buffer.Bytes())
@@ -164,13 +167,13 @@ func (c *paddingConn) ReadBuffer(buffer *buf.Buffer) error {
 			c.paddingRemaining = 0
 		}
 		if c.readPadding < kFirstPaddings {
-			var paddingHdr [4]byte
+			var paddingHdr [PaddingHeaderLength]byte
 			_, err := io.ReadFull(c.ExtendedConn, paddingHdr[:])
 			if err != nil {
 				return err
 			}
-			originalDataSize := int(binary.BigEndian.Uint16(paddingHdr[:2]))
-			paddingLen := int(binary.BigEndian.Uint16(paddingHdr[2:]))
+			originalDataSize := int(binary.BigEndian.Uint16(paddingHdr[:PaddingOriginalSizeLen]))
+			paddingLen := int(binary.BigEndian.Uint16(paddingHdr[PaddingOriginalSizeLen:]))
 			c.readPadding++
 			c.paddingRemaining = paddingLen
 
@@ -212,8 +215,8 @@ func (c *paddingConn) WriteBuffer(buffer *buf.Buffer) error {
 			buffer = newBuf
 		}
 		header := buffer.ExtendHeader(PaddingHeaderLength)
-		binary.BigEndian.PutUint16(header[:2], uint16(bufferLen))
-		binary.BigEndian.PutUint16(header[2:], uint16(paddingLen))
+		binary.BigEndian.PutUint16(header[:PaddingOriginalSizeLen], uint16(bufferLen))
+		binary.BigEndian.PutUint16(header[PaddingOriginalSizeLen:], uint16(paddingLen))
 		buffer.Extend(paddingLen)
 		err := c.ExtendedConn.WriteBuffer(buffer)
 		c.writeAccess.Unlock()
@@ -255,11 +258,11 @@ func (c *vectorisedPaddingConn) WriteVectorised(buffers []*buf.Buffer) error {
 		paddingLen := MinPaddingLength + rand.Intn(MaxRandomPaddingSpan)
 		header := buf.NewSize(PaddingHeaderLength)
 		hdrBytes := header.Extend(PaddingHeaderLength)
-		binary.BigEndian.PutUint16(hdrBytes[:2], uint16(bufferLen))
-		binary.BigEndian.PutUint16(hdrBytes[2:], uint16(paddingLen))
+		binary.BigEndian.PutUint16(hdrBytes[:PaddingOriginalSizeLen], uint16(bufferLen))
+		binary.BigEndian.PutUint16(hdrBytes[PaddingOriginalSizeLen:], uint16(paddingLen))
 		padding := buf.NewSize(paddingLen)
 		padding.Extend(paddingLen)
-		allBuffers := make([]*buf.Buffer, 0, len(buffers)+2)
+		allBuffers := make([]*buf.Buffer, 0, len(buffers)+PaddingVectorExtraBuffers)
 		allBuffers = append(allBuffers, header)
 		allBuffers = append(allBuffers, buffers...)
 		allBuffers = append(allBuffers, padding)

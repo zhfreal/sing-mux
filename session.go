@@ -158,10 +158,10 @@ func parseRange(v any) Range {
 	return Range{}
 }
 
-func newClientSession(conn net.Conn, protocol byte) (abstractSession, error) {
+func newClientSession(conn net.Conn, protocol byte, h2MuxIdleTimeout time.Duration) (abstractSession, error) {
 	switch protocol {
 	case ProtocolH2Mux:
-		session, err := newH2MuxClient(conn)
+		session, err := newH2MuxClient(conn, h2MuxIdleTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -183,10 +183,10 @@ func newClientSession(conn net.Conn, protocol byte) (abstractSession, error) {
 	}
 }
 
-func newServerSession(conn net.Conn, protocol byte) (abstractSession, error) {
+func newServerSession(conn net.Conn, protocol byte, h2MuxIdleTimeout time.Duration) (abstractSession, error) {
 	switch protocol {
 	case ProtocolH2Mux:
-		return newH2MuxServer(conn), nil
+		return newH2MuxServer(conn, h2MuxIdleTimeout), nil
 	case ProtocolSmux:
 		client, err := smux.Server(conn, smuxConfig())
 		if err != nil {

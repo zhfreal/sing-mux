@@ -3,6 +3,7 @@ package mux
 import (
 	"context"
 	"net"
+	"time"
 
 	"github.com/metacubex/sing/common/bufio"
 	"github.com/metacubex/sing/common/debug"
@@ -25,6 +26,7 @@ type Service struct {
 	handler          ServiceHandler
 	padding          bool
 	brutal           BrutalOptions
+	h2MuxIdleTimeout time.Duration
 }
 
 type ServiceOptions struct {
@@ -33,11 +35,16 @@ type ServiceOptions struct {
 	Handler          ServiceHandler
 	Padding          bool
 	Brutal           BrutalOptions
+	H2MuxIdleTimeout time.Duration
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
 	if options.Brutal.Enabled && !BrutalAvailable && !debug.Enabled {
 		return nil, E.New("TCP Brutal is only supported on Linux")
+	}
+	h2MuxIdleTimeout := options.H2MuxIdleTimeout
+	if h2MuxIdleTimeout <= 0 {
+		h2MuxIdleTimeout = DefaultH2MuxIdleTimeout
 	}
 	return &Service{
 		newStreamContext: options.NewStreamContext,
@@ -45,6 +52,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 		handler:          options.Handler,
 		padding:          options.Padding,
 		brutal:           options.Brutal,
+		h2MuxIdleTimeout: h2MuxIdleTimeout,
 	}, nil
 }
 
@@ -58,7 +66,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.M
 	} else if s.padding {
 		return E.New("non-padded connection rejected")
 	}
-	session, err := newServerSession(conn, request.Protocol)
+	session, err := newServerSession(conn, request.Protocol, s.h2MuxIdleTimeout)
 	if err != nil {
 		return err
 	}
@@ -95,11 +103,11 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 		_ = stream.Close()
 		return E.Cause(err, "read multiplex stream request")
 	}
+	defer stream.Close()
 	metadata.Destination = request.Destination
 	if request.Network == N.NetworkTCP {
 		conn := &serverConn{ExtendedConn: bufio.NewExtendedConn(stream)}
 		if request.Destination.Fqdn == BrutalExchangeDomain {
-			defer stream.Close()
 			isV2 := request.Destination.Port == BrutalExchangePortV2
 			req, err := ReadBrutalRequest(conn)
 			if err != nil {
@@ -143,7 +151,7 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 				gain = uint32(req.CwndGain)
 			}
 			if gain == 0 {
-				gain = 20
+				gain = BrutalDefaultGain
 			}
 			err = SetBrutalOptions(sessionConn, sendBPS, groupID, gain)
 			if err != nil {
@@ -180,7 +188,6 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 			s.logger.InfoContext(ctx, "inbound multiplex connection to ", metadata.Destination)
 		}
 		s.handler.NewConnection(ctx, conn, metadata)
-		stream.Close()
 	} else {
 		var packetConn N.PacketConn
 		if !request.PacketAddr {
@@ -195,7 +202,6 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 			packetConn = &serverPacketAddrConn{ExtendedConn: bufio.NewExtendedConn(stream)}
 		}
 		s.handler.NewPacketConnection(ctx, packetConn, metadata)
-		stream.Close()
 	}
 	return nil
 }

@@ -24,9 +24,22 @@ const (
 	Version1
 )
 
+const (
+	StreamHeaderLen         = 2 // version + protocol byte
+	PaddingHeaderLen        = 2 // uint16 padding length
+	StreamFlagsLen          = 2 // uint16 stream flags
+	ResponseStatusHeaderLen = 1 // 1-byte statusSuccess / statusError
+	PacketLengthHeaderLen   = 2 // uint16 packet payload length
+	PaddingFlagLen          = 1 // 1-byte padding flag
+	StreamRequestVersionLen = 1 // 1-byte stream request version field
+
+	DefaultDestinationDomain = "sp.mux.sing-box.arpa"
+	DefaultDestinationPort   = 444
+)
+
 var Destination = M.Socksaddr{
-	Fqdn: "sp.mux.sing-box.arpa",
-	Port: 444,
+	Fqdn: DefaultDestinationDomain,
+	Port: DefaultDestinationPort,
 }
 
 type Request struct {
@@ -36,7 +49,7 @@ type Request struct {
 }
 
 func readUint16(reader io.Reader) (uint16, error) {
-	var b [2]byte
+	var b [PacketLengthHeaderLen]byte
 	if _, err := io.ReadFull(reader, b[:]); err != nil {
 		return 0, err
 	}
@@ -44,14 +57,14 @@ func readUint16(reader io.Reader) (uint16, error) {
 }
 
 func writeUint16(writer io.Writer, v uint16) error {
-	var b [2]byte
+	var b [PacketLengthHeaderLen]byte
 	binary.BigEndian.PutUint16(b[:], v)
 	_, err := writer.Write(b[:])
 	return err
 }
 
 func ReadRequest(reader io.Reader) (*Request, error) {
-	var header [2]byte
+	var header [StreamHeaderLen]byte
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		return nil, err
 	}
@@ -62,7 +75,7 @@ func ReadRequest(reader io.Reader) (*Request, error) {
 	}
 	var paddingEnabled bool
 	if version == Version1 {
-		var padByte [1]byte
+		var padByte [PaddingFlagLen]byte
 		if _, err := io.ReadFull(reader, padByte[:]); err != nil {
 			return nil, err
 		}
@@ -83,13 +96,13 @@ func ReadRequest(reader io.Reader) (*Request, error) {
 
 func EncodeRequest(request Request, payload []byte) *buf.Buffer {
 	var requestLen int
-	requestLen += 2
+	requestLen += StreamHeaderLen
 	var paddingLen uint16
 	if request.Version == Version1 {
-		requestLen += 1
+		requestLen += PaddingFlagLen
 		if request.Padding {
-			requestLen += 2
-			paddingLen = uint16(256 + rand.Intn(512))
+			requestLen += PaddingHeaderLen
+			paddingLen = uint16(MinPaddingLength + rand.Intn(MaxRandomPaddingSpan))
 			requestLen += int(paddingLen)
 		}
 	}
@@ -105,7 +118,7 @@ func EncodeRequest(request Request, payload []byte) *buf.Buffer {
 		}
 		common.Must(buffer.WriteByte(padByte))
 		if request.Padding {
-			binary.BigEndian.PutUint16(buffer.Extend(2), paddingLen)
+			binary.BigEndian.PutUint16(buffer.Extend(PaddingHeaderLen), paddingLen)
 			buffer.Extend(int(paddingLen))
 		}
 	}
@@ -148,8 +161,7 @@ func ReadStreamRequest(reader io.Reader) (*StreamRequest, error) {
 
 func streamRequestLen(request StreamRequest) int {
 	var rLen int
-	rLen += 1 // version
-	rLen += 2 // flags
+	rLen += StreamFlagsLen
 	rLen += M.SocksaddrSerializer.AddrPortLen(request.Destination)
 	return rLen
 }
@@ -166,7 +178,7 @@ func EncodeStreamRequest(request StreamRequest, buffer *buf.Buffer) error {
 			destination = Destination
 		}
 	}
-	binary.BigEndian.PutUint16(buffer.Extend(2), flags)
+	binary.BigEndian.PutUint16(buffer.Extend(StreamFlagsLen), flags)
 	return M.SocksaddrSerializer.WriteAddrPort(buffer, destination)
 }
 
@@ -176,7 +188,7 @@ type StreamResponse struct {
 }
 
 func ReadStreamResponse(reader io.Reader) (*StreamResponse, error) {
-	var statusBuf [1]byte
+	var statusBuf [ResponseStatusHeaderLen]byte
 	if _, err := io.ReadFull(reader, statusBuf[:]); err != nil {
 		return nil, err
 	}

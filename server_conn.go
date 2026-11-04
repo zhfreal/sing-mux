@@ -29,7 +29,7 @@ func (c *serverConn) HandshakeFailure(err error) error {
 	c.access.Lock()
 	defer c.access.Unlock()
 	errMessage := err.Error()
-	buffer := buf.NewSize(1 + rw.UvarintLen(uint64(len(errMessage))) + len(errMessage))
+	buffer := buf.NewSize(ResponseStatusHeaderLen + rw.UvarintLen(uint64(len(errMessage))) + len(errMessage))
 	defer buffer.Release()
 	common.Must(
 		buffer.WriteByte(statusError),
@@ -44,7 +44,7 @@ func (c *serverConn) Write(b []byte) (n int, err error) {
 		c.access.Unlock()
 		return c.ExtendedConn.Write(b)
 	}
-	buffer := buf.NewSize(1 + len(b))
+	buffer := buf.NewSize(ResponseStatusHeaderLen + len(b))
 	defer buffer.Release()
 	common.Must(
 		buffer.WriteByte(statusSuccess),
@@ -66,14 +66,14 @@ func (c *serverConn) WriteBuffer(buffer *buf.Buffer) error {
 		c.access.Unlock()
 		return c.ExtendedConn.WriteBuffer(buffer)
 	}
-	if buffer.Start() < 1 {
-		newBuf := buf.NewSize(buffer.Len() + 1)
-		newBuf.Resize(1, 0)
+	if buffer.Start() < ResponseStatusHeaderLen {
+		newBuf := buf.NewSize(buffer.Len() + ResponseStatusHeaderLen)
+		newBuf.Resize(ResponseStatusHeaderLen, 0)
 		common.Must1(newBuf.Write(buffer.Bytes()))
 		buffer.Release()
 		buffer = newBuf
 	}
-	buffer.ExtendHeader(1)[0] = statusSuccess
+	buffer.ExtendHeader(ResponseStatusHeaderLen)[0] = statusSuccess
 	c.responseWritten = true
 	c.access.Unlock()
 	return c.ExtendedConn.WriteBuffer(buffer)
@@ -83,7 +83,7 @@ func (c *serverConn) FrontHeadroom() int {
 	c.access.Lock()
 	defer c.access.Unlock()
 	if !c.responseWritten {
-		return 1
+		return ResponseStatusHeaderLen
 	}
 	return 0
 }
@@ -99,6 +99,7 @@ func (c *serverConn) Upstream() any {
 type serverPacketConn struct {
 	N.ExtendedConn
 	access          sync.Mutex
+	readAccess      sync.Mutex
 	destination     M.Socksaddr
 	responseWritten bool
 }
@@ -113,7 +114,7 @@ func (c *serverPacketConn) HandshakeFailure(err error) error {
 	c.access.Lock()
 	defer c.access.Unlock()
 	errMessage := err.Error()
-	buffer := buf.NewSize(1 + rw.UvarintLen(uint64(len(errMessage))) + len(errMessage))
+	buffer := buf.NewSize(ResponseStatusHeaderLen + rw.UvarintLen(uint64(len(errMessage))) + len(errMessage))
 	defer buffer.Release()
 	common.Must(
 		buffer.WriteByte(statusError),
@@ -123,6 +124,8 @@ func (c *serverPacketConn) HandshakeFailure(err error) error {
 }
 
 func (c *serverPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	length, err := readUint16(c.ExtendedConn)
 	if err != nil {
 		return
@@ -138,9 +141,9 @@ func (c *serverPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksad
 func (c *serverPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	c.access.Lock()
 	defer c.access.Unlock()
-	needed := 2
+	needed := PacketLengthHeaderLen
 	if !c.responseWritten {
-		needed += 1
+		needed += ResponseStatusHeaderLen
 	}
 	if buffer.Start() < needed {
 		newBuf := buf.NewSize(buffer.Len() + needed)
@@ -150,15 +153,17 @@ func (c *serverPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksad
 		buffer = newBuf
 	}
 	pLen := buffer.Len()
-	binary.BigEndian.PutUint16(buffer.ExtendHeader(2), uint16(pLen))
+	binary.BigEndian.PutUint16(buffer.ExtendHeader(PacketLengthHeaderLen), uint16(pLen))
 	if !c.responseWritten {
-		buffer.ExtendHeader(1)[0] = statusSuccess
+		buffer.ExtendHeader(ResponseStatusHeaderLen)[0] = statusSuccess
 		c.responseWritten = true
 	}
 	return c.ExtendedConn.WriteBuffer(buffer)
 }
 
 func (c *serverPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	length, err := readUint16(c.ExtendedConn)
 	if err != nil {
 		return
@@ -174,16 +179,16 @@ func (c *serverPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 func (c *serverPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	c.access.Lock()
 	defer c.access.Unlock()
-	needed := 2 + len(p)
+	needed := PacketLengthHeaderLen + len(p)
 	if !c.responseWritten {
-		needed += 1
+		needed += ResponseStatusHeaderLen
 	}
 	buffer := buf.NewSize(needed)
 	defer buffer.Release()
 	if !c.responseWritten {
 		common.Must(buffer.WriteByte(statusSuccess))
 	}
-	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(len(p)))
+	binary.BigEndian.PutUint16(buffer.Extend(PacketLengthHeaderLen), uint16(len(p)))
 	common.Must1(buffer.Write(p))
 	_, err = c.ExtendedConn.Write(buffer.Bytes())
 	if err != nil {
@@ -205,14 +210,15 @@ func (c *serverPacketConn) FrontHeadroom() int {
 	c.access.Lock()
 	defer c.access.Unlock()
 	if !c.responseWritten {
-		return 3
+		return ResponseStatusHeaderLen + PacketLengthHeaderLen
 	}
-	return 2
+	return PacketLengthHeaderLen
 }
 
 type serverPacketAddrConn struct {
 	N.ExtendedConn
 	access          sync.Mutex
+	readAccess      sync.Mutex
 	responseWritten bool
 }
 
@@ -226,7 +232,7 @@ func (c *serverPacketAddrConn) HandshakeFailure(err error) error {
 	c.access.Lock()
 	defer c.access.Unlock()
 	errMessage := err.Error()
-	buffer := buf.NewSize(1 + rw.UvarintLen(uint64(len(errMessage))) + len(errMessage))
+	buffer := buf.NewSize(ResponseStatusHeaderLen + rw.UvarintLen(uint64(len(errMessage))) + len(errMessage))
 	defer buffer.Release()
 	common.Must(
 		buffer.WriteByte(statusError),
@@ -236,6 +242,8 @@ func (c *serverPacketAddrConn) HandshakeFailure(err error) error {
 }
 
 func (c *serverPacketAddrConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	destination, err := M.SocksaddrSerializer.ReadAddrPort(c.ExtendedConn)
 	if err != nil {
 		return
@@ -262,9 +270,9 @@ func (c *serverPacketAddrConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 	defer c.access.Unlock()
 	destination := M.SocksaddrFromNet(addr)
 	addrPortLen := M.SocksaddrSerializer.AddrPortLen(destination)
-	needed := 2 + addrPortLen + len(p)
+	needed := PacketLengthHeaderLen + addrPortLen + len(p)
 	if !c.responseWritten {
-		needed += 1
+		needed += ResponseStatusHeaderLen
 	}
 	buffer := buf.NewSize(needed)
 	defer buffer.Release()
@@ -275,7 +283,7 @@ func (c *serverPacketAddrConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 	if err != nil {
 		return 0, err
 	}
-	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(len(p)))
+	binary.BigEndian.PutUint16(buffer.Extend(PacketLengthHeaderLen), uint16(len(p)))
 	common.Must1(buffer.Write(p))
 	_, err = c.ExtendedConn.Write(buffer.Bytes())
 	if err != nil {
@@ -286,6 +294,8 @@ func (c *serverPacketAddrConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 }
 
 func (c *serverPacketAddrConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	destination, err = M.SocksaddrSerializer.ReadAddrPort(c.ExtendedConn)
 	if err != nil {
 		return
@@ -305,9 +315,9 @@ func (c *serverPacketAddrConn) WritePacket(buffer *buf.Buffer, destination M.Soc
 	c.access.Lock()
 	defer c.access.Unlock()
 	addrPortLen := M.SocksaddrSerializer.AddrPortLen(destination)
-	needed := 2 + addrPortLen
+	needed := PacketLengthHeaderLen + addrPortLen
 	if !c.responseWritten {
-		needed += 1
+		needed += ResponseStatusHeaderLen
 	}
 	if buffer.Start() < needed {
 		newBuf := buf.NewSize(buffer.Len() + needed)
@@ -317,14 +327,14 @@ func (c *serverPacketAddrConn) WritePacket(buffer *buf.Buffer, destination M.Soc
 		buffer = newBuf
 	}
 	pLen := buffer.Len()
-	binary.BigEndian.PutUint16(buffer.ExtendHeader(2), uint16(pLen))
+	binary.BigEndian.PutUint16(buffer.ExtendHeader(PacketLengthHeaderLen), uint16(pLen))
 	err := M.SocksaddrSerializer.WriteAddrPort(buf.With(buffer.ExtendHeader(addrPortLen)), destination)
 	if err != nil {
 		buffer.Release()
 		return err
 	}
 	if !c.responseWritten {
-		buffer.ExtendHeader(1)[0] = statusSuccess
+		buffer.ExtendHeader(ResponseStatusHeaderLen)[0] = statusSuccess
 		c.responseWritten = true
 	}
 	return c.ExtendedConn.WriteBuffer(buffer)
@@ -342,7 +352,7 @@ func (c *serverPacketAddrConn) FrontHeadroom() int {
 	c.access.Lock()
 	defer c.access.Unlock()
 	if !c.responseWritten {
-		return 3 + M.MaxSocksaddrLength
+		return ResponseStatusHeaderLen + PacketLengthHeaderLen + M.MaxSocksaddrLength
 	}
-	return 2 + M.MaxSocksaddrLength
+	return PacketLengthHeaderLen + M.MaxSocksaddrLength
 }

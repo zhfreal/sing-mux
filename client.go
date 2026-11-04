@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/bufio"
 	E "github.com/metacubex/sing/common/exceptions"
 	"github.com/metacubex/sing/common/logger"
@@ -17,48 +16,61 @@ import (
 )
 
 const (
-	DefaultTCPTimeout    = 500 * time.Millisecond
-	DefaultMinStreams    = 8
-	MaxDrainRetries      = 10
-	DrainRetryInterval   = 50 * time.Millisecond
+	DefaultTCPTimeout                 = 500 * time.Millisecond
+	DefaultMinStreams                 = 8
+	MaxDrainRetries                   = 10
+	DrainRetryInterval                = 50 * time.Millisecond
+	DefaultStreamOpenRetries          = 2
+	DefaultBrutalCwndGain             = BrutalDefaultGain
+	DefaultStreamSwapDialTimeout      = 1 * time.Second
+	DefaultMaxHandshakeBufferCapacity = 4096
 )
 
 type Client struct {
-	dialer             N.Dialer
-	logger             logger.Logger
-	protocol           byte
-	maxConnections     int
-	minStreams         int
-	maxStreams         int
-	padding            bool
-	tcpTimeout         time.Duration
-	maxDrainRetries      int
-	drainRetryInterval   time.Duration
-	maxStreamSwapRetries int
-	access               sync.Mutex
-	connections        list.List[abstractSession]
-	brutal             BrutalOptions
-	cMaxReuseTimes     Range
-	hMaxRequestTimes   Range
-	hMaxReusableSecs   Range
+	dialer                     N.Dialer
+	logger                     logger.Logger
+	protocol                   byte
+	maxConnections             int
+	minStreams                 int
+	maxStreams                 int
+	padding                    bool
+	tcpTimeout                 time.Duration
+	maxDrainRetries            int
+	drainRetryInterval         time.Duration
+	maxStreamSwapRetries       int
+	streamSwapDialTimeout      time.Duration
+	maxHandshakeBufferCapacity int
+	streamOpenRetries          int
+	h2MuxIdleTimeout           time.Duration
+	access                     sync.Mutex
+	closed                     bool
+	connections                list.List[abstractSession]
+	brutal                     BrutalOptions
+	cMaxReuseTimes             Range
+	hMaxRequestTimes           Range
+	hMaxReusableSecs           Range
 }
 
 type Options struct {
-	Dialer             N.Dialer
-	Logger             logger.Logger
-	Protocol           string
-	MaxConnections     int
-	MinStreams         int
-	MaxStreams         int
-	Padding            bool
-	TCPTimeout         time.Duration
-	MaxDrainRetries      int
-	DrainRetryInterval   time.Duration
-	MaxStreamSwapRetries int
-	Brutal               BrutalOptions
-	CMaxReuseTimes     any
-	HMaxRequestTimes   any
-	HMaxReusableSecs   any
+	Dialer                     N.Dialer
+	Logger                     logger.Logger
+	Protocol                   string
+	MaxConnections             int
+	MinStreams                 int
+	MaxStreams                 int
+	Padding                    bool
+	TCPTimeout                 time.Duration
+	MaxDrainRetries            int
+	DrainRetryInterval         time.Duration
+	MaxStreamSwapRetries       int
+	StreamSwapDialTimeout      time.Duration
+	MaxHandshakeBufferCapacity int
+	StreamOpenRetries          int
+	H2MuxIdleTimeout           time.Duration
+	Brutal                     BrutalOptions
+	CMaxReuseTimes             any
+	HMaxRequestTimes           any
+	HMaxReusableSecs           any
 }
 
 type BrutalOptions struct {
@@ -73,20 +85,24 @@ type BrutalOptions struct {
 
 func NewClient(options Options) (*Client, error) {
 	client := &Client{
-		dialer:           options.Dialer,
-		logger:           options.Logger,
-		maxConnections:   options.MaxConnections,
-		minStreams:       options.MinStreams,
-		maxStreams:       options.MaxStreams,
-		padding:            options.Padding,
-		tcpTimeout:         options.TCPTimeout,
-		maxDrainRetries:      options.MaxDrainRetries,
-		drainRetryInterval:   options.DrainRetryInterval,
-		maxStreamSwapRetries: options.MaxStreamSwapRetries,
-		brutal:               options.Brutal,
-		cMaxReuseTimes:     parseRange(options.CMaxReuseTimes),
-		hMaxRequestTimes:   parseRange(options.HMaxRequestTimes),
-		hMaxReusableSecs:   parseRange(options.HMaxReusableSecs),
+		dialer:                     options.Dialer,
+		logger:                     options.Logger,
+		maxConnections:             options.MaxConnections,
+		minStreams:                 options.MinStreams,
+		maxStreams:                 options.MaxStreams,
+		padding:                    options.Padding,
+		tcpTimeout:                 options.TCPTimeout,
+		maxDrainRetries:            options.MaxDrainRetries,
+		drainRetryInterval:         options.DrainRetryInterval,
+		maxStreamSwapRetries:       options.MaxStreamSwapRetries,
+		streamSwapDialTimeout:      options.StreamSwapDialTimeout,
+		maxHandshakeBufferCapacity: options.MaxHandshakeBufferCapacity,
+		streamOpenRetries:          options.StreamOpenRetries,
+		h2MuxIdleTimeout:           options.H2MuxIdleTimeout,
+		brutal:                     options.Brutal,
+		cMaxReuseTimes:             parseRange(options.CMaxReuseTimes),
+		hMaxRequestTimes:           parseRange(options.HMaxRequestTimes),
+		hMaxReusableSecs:           parseRange(options.HMaxReusableSecs),
 	}
 	if client.dialer == nil {
 		client.dialer = N.SystemDialer
@@ -106,6 +122,18 @@ func NewClient(options Options) (*Client, error) {
 	if client.maxStreamSwapRetries <= 0 {
 		client.maxStreamSwapRetries = MaxStreamSwapRetries
 	}
+	if client.streamSwapDialTimeout <= 0 {
+		client.streamSwapDialTimeout = DefaultStreamSwapDialTimeout
+	}
+	if client.maxHandshakeBufferCapacity <= 0 {
+		client.maxHandshakeBufferCapacity = DefaultMaxHandshakeBufferCapacity
+	}
+	if client.streamOpenRetries <= 0 {
+		client.streamOpenRetries = DefaultStreamOpenRetries
+	}
+	if client.h2MuxIdleTimeout <= 0 {
+		client.h2MuxIdleTimeout = DefaultH2MuxIdleTimeout
+	}
 	switch options.Protocol {
 	case "", "h2mux":
 		client.protocol = ProtocolH2Mux
@@ -120,6 +148,12 @@ func NewClient(options Options) (*Client, error) {
 }
 
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return nil, net.ErrClosed
+	}
+	c.access.Unlock()
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		stream, err := c.openStream(ctx)
@@ -153,6 +187,12 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 }
 
 func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return nil, net.ErrClosed
+	}
+	c.access.Unlock()
 	stream, err := c.openStream(ctx)
 	if err != nil {
 		return nil, err
@@ -167,7 +207,11 @@ func (c *Client) openStream(ctx context.Context) (net.Conn, error) {
 		stream  net.Conn
 		err     error
 	)
-	for attempts := 0; attempts < 2; attempts++ {
+	retries := c.streamOpenRetries
+	if retries <= 0 {
+		retries = DefaultStreamOpenRetries
+	}
+	for attempts := 0; attempts < retries; attempts++ {
 		session, err = c.offer(ctx)
 		if err != nil {
 			continue
@@ -211,12 +255,21 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 	c.access.Lock()
 	defer c.access.Unlock()
 
+	if c.closed {
+		return nil, net.ErrClosed
+	}
+
 	now := time.Now()
-	var sessions []abstractSession
+	var (
+		validSessionCount int
+		firstAvailable    abstractSession
+		minSession        abstractSession
+		minStreams        = math.MaxInt
+	)
 	for element := c.connections.Front(); element != nil; {
 		sess := element.Value
-		if element.Value.IsClosed() {
-			element.Value.Close()
+		if sess.IsClosed() {
+			sess.Close()
 			nextElement := element.Next()
 			c.connections.Remove(element)
 			element = nextElement
@@ -233,51 +286,60 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 			element = element.Next()
 			continue
 		}
-		sessions = append(sessions, element.Value)
+		validSessionCount++
+		if sess.CanTakeNewRequest() {
+			if c.brutal.Enabled {
+				if firstAvailable == nil {
+					firstAvailable = sess
+				}
+			} else {
+				ns := sess.NumStreams()
+				if ns < minStreams {
+					minStreams = ns
+					minSession = sess
+				}
+			}
+		}
 		element = element.Next()
 	}
 	if c.brutal.Enabled {
-		available := common.Filter(sessions, abstractSession.CanTakeNewRequest)
-		if len(available) > 0 {
-			sess := available[0]
-			if c.maxStreams > 0 && sess.NumStreams() >= c.maxStreams {
+		if firstAvailable != nil {
+			if c.maxStreams > 0 && firstAvailable.NumStreams() >= c.maxStreams {
 				return c.offerNew(ctx)
 			}
-			if wrapper, ok := sess.(*sessionWrapper); ok {
+			if wrapper, ok := firstAvailable.(*sessionWrapper); ok {
 				wrapper.activeStreams.Add(1)
 				wrapper.ConsumeReuse()
 			}
-			return sess, nil
+			return firstAvailable, nil
 		}
 		return c.offerNew(ctx)
 	}
-	session := common.MinBy(common.Filter(sessions, abstractSession.CanTakeNewRequest), abstractSession.NumStreams)
-	if session == nil {
+	if minSession == nil {
 		return c.offerNew(ctx)
 	}
-	numStreams := session.NumStreams()
-	if numStreams == 0 {
-		if wrapper, ok := session.(*sessionWrapper); ok {
+	if minStreams == 0 {
+		if wrapper, ok := minSession.(*sessionWrapper); ok {
 			wrapper.activeStreams.Add(1)
 			wrapper.ConsumeReuse()
 		}
-		return session, nil
+		return minSession, nil
 	}
 	if c.maxConnections > 0 {
-		if len(sessions) >= c.maxConnections || numStreams < c.minStreams {
-			if wrapper, ok := session.(*sessionWrapper); ok {
+		if validSessionCount >= c.maxConnections || minStreams < c.minStreams {
+			if wrapper, ok := minSession.(*sessionWrapper); ok {
 				wrapper.activeStreams.Add(1)
 				wrapper.ConsumeReuse()
 			}
-			return session, nil
+			return minSession, nil
 		}
 	} else {
-		if c.maxStreams > 0 && numStreams < c.maxStreams {
-			if wrapper, ok := session.(*sessionWrapper); ok {
+		if c.maxStreams > 0 && minStreams < c.maxStreams {
+			if wrapper, ok := minSession.(*sessionWrapper); ok {
 				wrapper.activeStreams.Add(1)
 				wrapper.ConsumeReuse()
 			}
-			return session, nil
+			return minSession, nil
 		}
 	}
 	return c.offerNew(ctx)
@@ -304,7 +366,7 @@ func (c *Client) offerNew(ctx context.Context) (abstractSession, error) {
 	if c.padding {
 		conn = newPaddingConn(conn)
 	}
-	rawSession, err := newClientSession(conn, c.protocol)
+	rawSession, err := newClientSession(conn, c.protocol, c.h2MuxIdleTimeout)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -356,7 +418,7 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 	defer conn.Close()
 	gain := c.brutal.CwndGain
 	if gain == 0 {
-		gain = 20
+		gain = DefaultBrutalCwndGain
 	}
 	req := BrutalExchangeRequest{
 		ReceiveBPS: c.brutal.ReceiveBPS,
@@ -384,7 +446,7 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 		clientGain = uint32(resp.CwndGain)
 	}
 	if clientGain == 0 {
-		clientGain = 20
+		clientGain = DefaultBrutalCwndGain
 	}
 	clientBrutalErr := SetBrutalOptions(sessionConn, sendBPS, groupID, clientGain)
 	if clientBrutalErr != nil {
@@ -434,6 +496,9 @@ func (c *Client) Reset() {
 }
 
 func (c *Client) Close() error {
+	c.access.Lock()
+	c.closed = true
+	c.access.Unlock()
 	c.Reset()
 	return nil
 }
