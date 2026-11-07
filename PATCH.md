@@ -1,6 +1,6 @@
 # Codebase Change Statement: sing-mux
 
-**Current Codebase:** `zhfreal/sing-mux` (`main-patched`)  
+**Current Codebase:** `zhfreal/sing-mux` (`main-patched`, Tag: `v0.3.12-patch10` / `v0.3.12+patch10`)  
 **Original Upstream Baseline:** `MetaCubeX/sing-mux` (Release `v0.3.12`, Git Commit `714fc2e0d3753578ee1beeb8f39943dc6c5aa426`)  
 **Repository Location:** `./sing-mux-mine`  
 **Status:** Production-Ready, Race-Verified (`go test -race ./...` passing 100%)
