@@ -511,7 +511,7 @@ func (c *clientPacketConn) Read(b []byte) (n int, err error) {
 	if err != nil {
 		return
 	}
-	if cap(b) < int(length) {
+	if len(b) < int(length) {
 		_, _ = io.CopyN(io.Discard, c.conn, int64(length))
 		return 0, io.ErrShortBuffer
 	}
@@ -619,7 +619,7 @@ func (c *clientPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 	if err != nil {
 		return
 	}
-	if cap(p) < int(length) {
+	if len(p) < int(length) {
 		_, _ = io.CopyN(io.Discard, c.conn, int64(length))
 		return 0, nil, io.ErrShortBuffer
 	}
@@ -723,7 +723,7 @@ func (c *clientPacketAddrConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 	if err != nil {
 		return
 	}
-	if cap(p) < int(length) {
+	if len(p) < int(length) {
 		_, _ = io.CopyN(io.Discard, c.conn, int64(length))
 		return 0, nil, io.ErrShortBuffer
 	}

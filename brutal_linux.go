@@ -55,8 +55,30 @@ func getKernelBrutalVersion(fd int) int {
 	return 0
 }
 
+func unwrapBrutalSyscallConn(conn net.Conn) (syscall.Conn, bool) {
+	for c := conn; c != nil; {
+		if sc, ok := c.(syscall.Conn); ok {
+			return sc, true
+		}
+		if w, ok := c.(interface{ RawConn() net.Conn }); ok {
+			c = w.RawConn()
+		} else if w, ok := c.(interface{ NetConn() net.Conn }); ok {
+			c = w.NetConn()
+		} else if w, ok := c.(interface{ Upstream() any }); ok {
+			if next, ok := w.Upstream().(net.Conn); ok {
+				c = next
+			} else {
+				break
+			}
+		} else {
+			break
+		}
+	}
+	return common.Cast[syscall.Conn](conn)
+}
+
 func SetBrutalOptions(conn net.Conn, sendBPS uint64, groupID uint64, cwndGain ...uint32) error {
-	syscallConn, loaded := common.Cast[syscall.Conn](conn)
+	syscallConn, loaded := unwrapBrutalSyscallConn(conn)
 	if !loaded {
 		// Nested multiplexing or virtual tunnel stream: underlying transport manages congestion.
 		// Allow graceful negotiation without erroring out.

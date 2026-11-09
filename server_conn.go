@@ -168,7 +168,7 @@ func (c *serverPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 	if err != nil {
 		return
 	}
-	if cap(p) < int(length) {
+	if len(p) < int(length) {
 		_, _ = io.CopyN(io.Discard, c.ExtendedConn, int64(length))
 		return 0, nil, io.ErrShortBuffer
 	}
@@ -257,7 +257,7 @@ func (c *serverPacketAddrConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 	if err != nil {
 		return
 	}
-	if cap(p) < int(length) {
+	if len(p) < int(length) {
 		_, _ = io.CopyN(io.Discard, c.ExtendedConn, int64(length))
 		return 0, nil, io.ErrShortBuffer
 	}

@@ -13,11 +13,13 @@ This document specifies the complete architectural, functional, and performance 
 
 The modifications are structured into two distinct categories:
 1. **Type 1: New Features & Protocol Extensions**: Anti-fingerprinting periodic connection retirement (XMUX style), TCP Brutal v2 protocol negotiation with tenant isolation, transparent stream failover buffering, and half-close stream propagation.
+
+- **Named Default Constants for All Tunable Parameters**: Extracted all added and modified intervals, timeouts, timers, slice lengths, slab/channel capacities, and protocol thresholds into named `const` definitions (`DefaultBrutalPingInterval`, `DefaultBrutalExchangeTimeout`, `DefaultSessionAcceptBacklog`, `DefaultIdleSessionTimeout`, `DefaultIdleSessionSweepPeriod`, `DefaultMaxLeftoverRetainCap`, `DefaultSmallLeftoverCopyLen`, `DefaultPooledTimerInitDuration`, `MaxPacketBufferCapacity`) so zero magic numbers appear inline in the codebase.
 2. **Type 2: Bug Fixes, Concurrency & Memory Safety Remediations**: Defensive front headroom reallocation preventing buffer overflow panics, unread payload byte draining on short buffers preventing stream desynchronization, separate read/write mutexes eliminating data races, HTTP/2 request pipe leak fixes, and hot-path zero-allocation refactoring.
 
 ---
 
-## 2. Type 1: New Features & Protocol Extensions
+## 2. New Features
 
 ### 2.1 XMUX-Style Periodic Session Retirement & Graceful Draining (`session.go`, `client.go`, `error.go`)
 * **Session Lifecycle Wrapper (`sessionWrapper`)**:
@@ -64,7 +66,7 @@ The modifications are structured into two distinct categories:
 
 ---
 
-## 3. Type 2: Bug Fixes, Concurrency & Memory Safety Remediations
+## 3. Bugfixes
 
 ### 3.1 Defensive Front Headroom Reallocation (Buffer Overflow Panic Prevention) (`server_conn.go`, `client_conn.go`)
 * **Elimination of `panic: buffer overflow`**:
@@ -121,6 +123,20 @@ The modifications are structured into two distinct categories:
   - Cached kernel version in `cachedBrutalVersion` only when `ver > 0`, avoiding cache poisoning from pre-connect `getsockopt` calls.
   - Tolerates `EPERM` without error logging when kernel policy route locks are active.
 
+### 3.8 Slice Bounds Corruption Fix (`len(p)` vs `cap(p)`), Vectorised Handshake Race Fix, Closed H2 Buffer Release & Lock-Free PRNG (`client_conn.go`, `server_conn.go`, `protocol_conn.go`, `h2mux.go`, `client.go`, `session.go`, `protocol.go`, `padding.go`)
+* **Critical Slice Bounds Corruption Fix in Packet Reads (`client_conn.go`, `server_conn.go`)**:
+  - In upstream, all 5 packet read methods (`clientPacketConn.Read`, `clientPacketConn.ReadFrom`, `clientPacketAddrConn.ReadFrom`, `serverPacketConn.ReadFrom`, and `serverPacketAddrConn.ReadFrom`) checked `if cap(p) < int(length)` instead of `if len(p) < int(length)` before calling `io.ReadFull(conn, p[:length])`. When a caller passed a sub-sliced buffer where `len(p) < int(length) <= cap(p)`, `p[:length]` silently overwrote memory beyond `len(p)` in the caller's backing array.
+  - Replaced all 5 checks with `if len(p) < int(length)` (and `if len(b) < int(length)`), draining `length` bytes and returning `io.ErrShortBuffer` whenever the caller's visible slice length is smaller than the incoming UDP datagram.
+* **Critical Wire Framing Race Fix in `vectorisedProtocolConn.WriteVectorised` (`protocol_conn.go`)**:
+  - Previously, `vectorisedProtocolConn.WriteVectorised` set `c.requestWritten = true` and released `c.access.Unlock()` *before* encoding and writing the initial protocol handshake header to `c.writer`. A concurrent writer arriving during that window observed `c.requestWritten == true` and wrote stream frames to the underlying connection ahead of the protocol handshake header, corrupting the wire stream.
+  - Held `c.access.Lock()` across `EncodeRequest` and `c.writer.WriteVectorised(allBuffers)`, setting `c.requestWritten = true` only after the handshake write succeeds.
+* **Buffer Pool Leak Fix on Closed HTTP/2 Mux Wrapper (`h2mux.go`)**:
+  - In `h2MuxConnWrapper.WriteBuffer`, when `w.closed` was true, the method returned `net.ErrClosed` without releasing `buffer`, leaking the pooled `*buf.Buffer`. Added `buffer.Release()` before returning `net.ErrClosed`.
+* **Immediate Dead Session Eviction in `openStream` (`client.go`)**:
+  - When `session.Open(c.tcpTimeout)` failed in `Client.openStream`, calling `c.CloseSession(w)` (instead of only `maybeCloseSession` + `session.Close()`) immediately removes the dead session from `c.connections`, preventing subsequent `offer()` calls from repeatedly scanning closed sessions.
+* **Lock-Free Atomic SplitMix64 PRNG on Padding & Session Retirement Hot Paths (`session.go`, `protocol.go`, `padding.go`)**:
+  - Replaced global mutex-contended `math/rand.Intn` calls in `EncodeRequest`, `paddingConn.write`, `paddingConn.WriteBuffer`, `vectorisedPaddingConn.WriteVectorised`, and `Range.Rand` with a lock-free atomic SplitMix64 generator (`fastRandIntn`), eliminating global RNG mutex contention under high concurrency.
+
 ### 3.7 Packet Write Coalescing & Frame Fragmentation Fix (`client_conn.go`, `server_conn.go`, `protocol_conn.go`)
 * **Single-Buffer Frame Serialization**:
   - Coalesced length prefix (2 bytes) and payload into a single allocated `buf.Buffer` write across both `clientPacketConn.Write` and `clientPacketConn.WriteTo`.
@@ -130,6 +146,19 @@ The modifications are structured into two distinct categories:
   - Added defensive `buffer.Release()` on `clientPacketAddrConn.WritePacket` and `serverPacketAddrConn.WritePacket` header serialization errors.
   - Pre-allocated vectorised buffers in `protocol_conn.go` and `padding.go` to eliminate intermediate slice reallocations on frame writes.
   - Hardened `clientConn` connection teardown: `trySwapConnection` checks `c.closed` under `c.connMu.RLock()` to prevent dialing new streams or reporting false swap successes on closed sockets; `Read()` and `write()` check `c.closed` on waking to return `net.ErrClosed` immediately; `Close()` zeroes `c.client` reference to release pool/session resources for GC.
+
+---
+
+### 3.9 Zero-Allocation TCPAddr Tenant Group Hashing on Server Brutal v2 (`server.go`)
+* **Direct `*net.TCPAddr` IP Extraction for Brutal v2 Tenant Isolation**:
+  - In `Server.NewConnection`, when `userTenant` is derived from `conn.RemoteAddr()` to hash with the client's Brutal v2 `groupID` (`deriveTenantGroupID(userTenant, clientGroupID)`), added a fast-path type assertion for `*net.TCPAddr` that normalizes IPv4-in-IPv6 (`ip.To4()`) and converts the raw IP bytes directly without invoking `RemoteAddr().String()` + `net.SplitHostPort`, eliminating 2 heap string allocations on every Brutal v2 negotiation stream.
+
+* **Multi-Wrapper `syscall.Conn` Unwrapping in `SetBrutalOptions` (`brutal_linux.go`)**:
+  - Added `unwrapBrutalSyscallConn` in `SetBrutalOptions` to iteratively traverse `RawConn() net.Conn`, `NetConn() net.Conn`, and `Upstream() any` connection wrappers before falling back to `common.Cast[syscall.Conn](conn)`, ensuring kernel TCP Brutal v2 `setsockopt` reaches the underlying socket across all listener and statistics wrappers.
+* **Context Cancellation Fast-Exit in `openStream`, Closed-Client Drain Short-Circuit & Bounded Control-Plane Deadlines (`client.go`, `server.go`)**:
+  - Short-circuited `Client.openStream` retry loops immediately when `ctx.Err() != nil` so canceled caller contexts do not dial redundant retry sessions.
+  - Added a `c.closed` fast-exit check at the start of `Client.maybeCloseSession` so retired sessions do not continue scheduling background `time.AfterFunc` drain retries after `Client.Close()`.
+  - Enforced explicit read/write deadlines (`stream.SetDeadline`) around `Client.brutalExchange` (`c.tcpTimeout` / caller context deadline) and `Service.newConnection` (`DefaultTCPTimeout`) initial stream header reads, clearing deadlines before handing the stream to the application handler. This prevents stalled peers from holding `c.access.Lock()` during `Client.offerNew` or leaking server connection-handler goroutines.
 
 ---
 

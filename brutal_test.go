@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"time"
 	"bytes"
 	"encoding/binary"
 	"testing"
@@ -186,3 +187,14 @@ func TestBrutalResponseTruncatedV2(t *testing.T) {
 	}
 }
 
+func TestMaybeCloseSessionStopsWhenClientClosed(t *testing.T) {
+	c := &Client{
+		closed: true,
+	}
+	w := &sessionWrapper{
+		createdAt:    time.Now().Add(-10 * time.Second),
+		unreusableAt: time.Now().Add(-1 * time.Second),
+	}
+	// Should return immediately without panicking or accessing nil abstractSession
+	c.maybeCloseSession(w, 0)
+}

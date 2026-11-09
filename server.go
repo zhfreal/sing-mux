@@ -108,6 +108,7 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 	if request.Network == N.NetworkTCP {
 		conn := &serverConn{ExtendedConn: bufio.NewExtendedConn(stream)}
 		if request.Destination.Fqdn == BrutalExchangeDomain {
+			_ = stream.SetDeadline(time.Now().Add(DefaultTCPTimeout))
 			isV2 := request.Destination.Port == BrutalExchangePortV2
 			req, err := ReadBrutalRequest(conn)
 			if err != nil {
@@ -136,7 +137,9 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 					userTenant = metadata.Source.Fqdn
 				}
 				if userTenant == "" && sessionConn != nil && sessionConn.RemoteAddr() != nil {
-					if host, _, err := net.SplitHostPort(sessionConn.RemoteAddr().String()); err == nil {
+					if tAddr, ok := sessionConn.RemoteAddr().(*net.TCPAddr); ok && len(tAddr.IP) > 0 {
+						userTenant = tAddr.IP.String()
+					} else if host, _, err := net.SplitHostPort(sessionConn.RemoteAddr().String()); err == nil {
 						userTenant = host
 					} else {
 						userTenant = sessionConn.RemoteAddr().String()

@@ -3,7 +3,6 @@ package mux
 import (
 	"encoding/binary"
 	"io"
-	"math/rand"
 
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
@@ -102,7 +101,7 @@ func EncodeRequest(request Request, payload []byte) *buf.Buffer {
 		requestLen += PaddingFlagLen
 		if request.Padding {
 			requestLen += PaddingHeaderLen
-			paddingLen = uint16(MinPaddingLength + rand.Intn(MaxRandomPaddingSpan))
+			paddingLen = uint16(MinPaddingLength + fastRandIntn(MaxRandomPaddingSpan))
 			requestLen += int(paddingLen)
 		}
 	}

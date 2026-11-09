@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"io"
 	"bytes"
 	"net"
 	"net/netip"
@@ -13,7 +14,15 @@ import (
 
 type mockExtendedPipe struct {
 	net.Conn
+	readBuf  *bytes.Buffer
 	writeBuf *bytes.Buffer
+}
+
+func (m *mockExtendedPipe) Read(p []byte) (n int, err error) {
+	if m.readBuf == nil {
+		return 0, io.EOF
+	}
+	return m.readBuf.Read(p)
 }
 
 func (m *mockExtendedPipe) Write(p []byte) (n int, err error) {
@@ -108,5 +117,31 @@ func TestH2MuxConnWrapperNilFlusher(t *testing.T) {
 
 	if !bytes.Equal(out.Bytes(), []byte("test-databuffer-data")) {
 		t.Fatalf("unexpected output: %q", out.Bytes())
+	}
+}
+
+func TestServerPacketConnShortBufferRespectsLenNotCap(t *testing.T) {
+	inBuf := &bytes.Buffer{}
+	// Write a 20-byte UDP packet frame (2-byte length = 20, followed by 20 bytes)
+	_ = writeUint16(inBuf, 20)
+	inBuf.Write(bytes.Repeat([]byte{'A'}, 20))
+
+	extPipe := &mockExtendedPipe{readBuf: inBuf, writeBuf: &bytes.Buffer{}}
+	spc := &serverPacketConn{
+		ExtendedConn: bufio.NewExtendedConn(extPipe),
+	}
+
+	// Backing array has capacity 64, but caller passes slice of length 10.
+	// ReadFrom must return io.ErrShortBuffer and NEVER overwrite backing[10:20].
+	backing := bytes.Repeat([]byte{'Z'}, 64)
+	shortSlice := backing[:10]
+	_, _, err := spc.ReadFrom(shortSlice)
+	if err != io.ErrShortBuffer {
+		t.Fatalf("expected io.ErrShortBuffer when len(p)=10 < packet length 20, got %v", err)
+	}
+	for i := 10; i < 64; i++ {
+		if backing[i] != 'Z' {
+			t.Fatalf("ReadFrom corrupted backing array past len(p) at index %d: got %c", i, backing[i])
+		}
 	}
 }

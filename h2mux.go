@@ -156,6 +156,7 @@ func (w *h2MuxConnWrapper) WriteBuffer(buffer *buf.Buffer) error {
 	w.access.Lock()
 	defer w.access.Unlock()
 	if w.closed {
+		buffer.Release()
 		return net.ErrClosed
 	}
 	err := w.ExtendedConn.WriteBuffer(buffer)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"strconv"
 	"strings"
@@ -60,7 +59,7 @@ func (s *sessionWrapper) CanTakeNewRequest() bool {
 }
 
 func (s *sessionWrapper) IsClosed() bool {
-	return s.closed.Load() || s.abstractSession.IsClosed()
+	return s.closed.Load() || (s.abstractSession != nil && s.abstractSession.IsClosed())
 }
 
 func (s *sessionWrapper) ConsumeReuse() {
@@ -110,6 +109,23 @@ type Range struct {
 	Max int
 }
 
+var fastRandState atomic.Uint64
+
+func init() {
+	fastRandState.Store(uint64(time.Now().UnixNano()) | 1)
+}
+
+func fastRandIntn(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	z := fastRandState.Add(0x9e3779b97f4a7c15)
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	z ^= z >> 31
+	return int((z >> 33) % uint64(n))
+}
+
 func (r Range) Rand() int {
 	if r.Min == r.Max {
 		return r.Min
@@ -117,7 +133,7 @@ func (r Range) Rand() int {
 	if r.Min > r.Max {
 		return r.Max
 	}
-	return r.Min + rand.Intn(r.Max-r.Min+1)
+	return r.Min + fastRandIntn(r.Max-r.Min+1)
 }
 
 func parseRange(v any) Range {

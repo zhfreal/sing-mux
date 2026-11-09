@@ -72,11 +72,14 @@ func (c *vectorisedProtocolConn) WriteVectorised(buffers []*buf.Buffer) error {
 		c.access.Unlock()
 		return c.writer.WriteVectorised(buffers)
 	}
-	c.requestWritten = true
-	c.access.Unlock()
 	buffer := EncodeRequest(c.request, nil)
 	allBuffers := make([]*buf.Buffer, 0, len(buffers)+1)
 	allBuffers = append(allBuffers, buffer)
 	allBuffers = append(allBuffers, buffers...)
-	return c.writer.WriteVectorised(allBuffers)
+	err := c.writer.WriteVectorised(allBuffers)
+	if err == nil {
+		c.requestWritten = true
+	}
+	c.access.Unlock()
+	return err
 }

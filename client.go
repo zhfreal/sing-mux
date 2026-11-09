@@ -212,17 +212,24 @@ func (c *Client) openStream(ctx context.Context) (net.Conn, error) {
 		retries = DefaultStreamOpenRetries
 	}
 	for attempts := 0; attempts < retries; attempts++ {
+		if ctx != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		session, err = c.offer(ctx)
 		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return nil, err
+			}
 			continue
 		}
 		stream, err = session.Open(c.tcpTimeout)
 		if err != nil {
 			if w, ok := session.(*sessionWrapper); ok {
 				w.activeStreams.Add(-1)
-				c.maybeCloseSession(w, 0)
+				c.CloseSession(w)
+			} else {
+				c.CloseSession(session)
 			}
-			session.Close()
 			continue
 		}
 		break
@@ -414,6 +421,19 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 	if wantV2 {
 		port = BrutalExchangePortV2
 	}
+	exchangeTimeout := c.tcpTimeout
+	if exchangeTimeout <= 0 {
+		exchangeTimeout = DefaultTCPTimeout
+	}
+	if ctx != nil {
+		if dl, ok := ctx.Deadline(); ok {
+			_ = stream.SetDeadline(dl)
+		} else {
+			_ = stream.SetDeadline(time.Now().Add(exchangeTimeout))
+		}
+	} else {
+		_ = stream.SetDeadline(time.Now().Add(exchangeTimeout))
+	}
 	conn := &clientConn{conn: &wrapStream{Conn: stream}, destination: M.Socksaddr{Fqdn: BrutalExchangeDomain, Port: port}}
 	defer conn.Close()
 	gain := c.brutal.CwndGain
@@ -504,6 +524,12 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) maybeCloseSession(s *sessionWrapper, retries int) {
+	c.access.Lock()
+	closed := c.closed
+	c.access.Unlock()
+	if closed {
+		return
+	}
 	if s == nil || s.IsClosed() {
 		return
 	}

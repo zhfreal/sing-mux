@@ -3,7 +3,6 @@ package mux
 import (
 	"encoding/binary"
 	"io"
-	"math/rand"
 	"net"
 	"sync"
 
@@ -125,7 +124,7 @@ func (c *paddingConn) write(p []byte) (n int, err error) {
 	c.writeAccess.Lock()
 	if c.writePadding < kFirstPaddings {
 		c.writePadding++
-		paddingLen := MinPaddingLength + rand.Intn(MaxRandomPaddingSpan)
+		paddingLen := MinPaddingLength + fastRandIntn(MaxRandomPaddingSpan)
 		buffer := buf.NewSize(PaddingHeaderLength + len(p) + paddingLen)
 		defer buffer.Release()
 		header := buffer.Extend(PaddingHeaderLength)
@@ -206,7 +205,7 @@ func (c *paddingConn) WriteBuffer(buffer *buf.Buffer) error {
 			return common.Error(c.Write(buffer.Bytes()))
 		}
 		c.writePadding++
-		paddingLen := MinPaddingLength + rand.Intn(MaxRandomPaddingSpan)
+		paddingLen := MinPaddingLength + fastRandIntn(MaxRandomPaddingSpan)
 		if buffer.Start() < PaddingHeaderLength || buffer.FreeLen() < paddingLen {
 			newBuf := buf.NewSize(PaddingHeaderLength + bufferLen + paddingLen)
 			newBuf.Resize(PaddingHeaderLength, 0)
@@ -255,7 +254,7 @@ func (c *vectorisedPaddingConn) WriteVectorised(buffers []*buf.Buffer) error {
 			return nil
 		}
 		c.writePadding++
-		paddingLen := MinPaddingLength + rand.Intn(MaxRandomPaddingSpan)
+		paddingLen := MinPaddingLength + fastRandIntn(MaxRandomPaddingSpan)
 		header := buf.NewSize(PaddingHeaderLength)
 		hdrBytes := header.Extend(PaddingHeaderLength)
 		binary.BigEndian.PutUint16(hdrBytes[:PaddingOriginalSizeLen], uint16(bufferLen))
