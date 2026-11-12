@@ -109,6 +109,16 @@ type Range struct {
 	Max int
 }
 
+const (
+	splitMix64Gamma  = uint64(0x9e3779b97f4a7c15)
+	splitMix64Mix1   = uint64(0xbf58476d1ce4e5b9)
+	splitMix64Mix2   = uint64(0x94d049bb133111eb)
+	splitMix64Shift1 = 30
+	splitMix64Shift2 = 27
+	splitMix64Shift3 = 31
+	splitMix64Shift4 = 33
+)
+
 var fastRandState atomic.Uint64
 
 func init() {
@@ -119,11 +129,11 @@ func fastRandIntn(n int) int {
 	if n <= 1 {
 		return 0
 	}
-	z := fastRandState.Add(0x9e3779b97f4a7c15)
-	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
-	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
-	z ^= z >> 31
-	return int((z >> 33) % uint64(n))
+	z := fastRandState.Add(splitMix64Gamma)
+	z = (z ^ (z >> splitMix64Shift1)) * splitMix64Mix1
+	z = (z ^ (z >> splitMix64Shift2)) * splitMix64Mix2
+	z ^= z >> splitMix64Shift3
+	return int((z >> splitMix64Shift4) % uint64(n))
 }
 
 func (r Range) Rand() int {

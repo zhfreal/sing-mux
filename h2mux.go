@@ -168,14 +168,21 @@ func (w *h2MuxConnWrapper) WriteBuffer(buffer *buf.Buffer) error {
 
 func (w *h2MuxConnWrapper) Close() error {
 	w.access.Lock()
+	if w.closed {
+		w.access.Unlock()
+		return nil
+	}
+	w.closed = true
+	w.access.Unlock()
+	err := w.ExtendedConn.Close()
+	w.access.Lock()
 	select {
 	case <-w.done:
 	default:
 		close(w.done)
 	}
-	w.closed = true
 	w.access.Unlock()
-	return w.ExtendedConn.Close()
+	return err
 }
 
 func (w *h2MuxConnWrapper) Upstream() any {

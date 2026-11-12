@@ -18,12 +18,21 @@ import (
 const (
 	DefaultTCPTimeout                 = 500 * time.Millisecond
 	DefaultMinStreams                 = 8
-	MaxDrainRetries                   = 10
-	DrainRetryInterval                = 50 * time.Millisecond
+	DefaultMaxDrainRetries            = 10
+	MaxDrainRetries                   = DefaultMaxDrainRetries
+	DefaultDrainRetryInterval         = 50 * time.Millisecond
+	DrainRetryInterval                = DefaultDrainRetryInterval
 	DefaultStreamOpenRetries          = 2
+	DefaultMaxStreamSwapRetries       = 2
+	MaxStreamSwapRetries              = DefaultMaxStreamSwapRetries
 	DefaultBrutalCwndGain             = BrutalDefaultGain
 	DefaultStreamSwapDialTimeout      = 1 * time.Second
+	StreamSwapDialTimeout             = DefaultStreamSwapDialTimeout
 	DefaultMaxHandshakeBufferCapacity = 4096
+	MaxHandshakeBufferCapacity        = DefaultMaxHandshakeBufferCapacity
+	InitialDrainRetryCount            = 0
+	DefaultUnlimitedRequests          = math.MaxInt32
+	DefaultUnlimitedReuseTimes        = -1
 )
 
 type Client struct {
@@ -164,7 +173,6 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 			conn:        stream,
 			destination: destination,
 			client:      c,
-			ctx:         ctx,
 		}
 		// h2mux and yamux support half-close; expose CloseWrite so callers
 		// send END_STREAM / FIN instead of falling back to a full close
@@ -248,7 +256,7 @@ func (c *Client) openStream(ctx context.Context) (net.Conn, error) {
 		onClose: func() {
 			if wrapper != nil {
 				wrapper.activeStreams.Add(-1)
-				c.maybeCloseSession(wrapper, 0)
+				c.maybeCloseSession(wrapper, InitialDrainRetryCount)
 			}
 		},
 	}
@@ -384,18 +392,18 @@ func (c *Client) offerNew(ctx context.Context) (abstractSession, error) {
 		createdAt:       now,
 	}
 	wrapper.activeStreams.Store(1)
-	wrapper.leftRequests.Store(math.MaxInt32)
+	wrapper.leftRequests.Store(DefaultUnlimitedRequests)
 	if req := c.hMaxRequestTimes.Rand(); req > 0 {
 		wrapper.leftRequests.Store(int32(req))
 	}
-	wrapper.leftReuseTimes.Store(-1)
+	wrapper.leftReuseTimes.Store(DefaultUnlimitedReuseTimes)
 	if reuse := c.cMaxReuseTimes.Rand(); reuse > 0 {
 		wrapper.leftReuseTimes.Store(int32(reuse))
 	}
 	if secs := c.hMaxReusableSecs.Rand(); secs > 0 {
 		wrapper.unreusableAt = now.Add(time.Duration(secs) * time.Second)
 		wrapper.timer = time.AfterFunc(time.Duration(secs)*time.Second, func() {
-			c.maybeCloseSession(wrapper, 0)
+			c.maybeCloseSession(wrapper, InitialDrainRetryCount)
 		})
 	}
 	session := wrapper
@@ -416,8 +424,8 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 	if err != nil {
 		return err
 	}
-	wantV2 := c.brutal.Version == 2 || (c.brutal.Version == 0 && c.brutal.GroupID > 0)
-	port := uint16(0)
+	wantV2 := c.brutal.Version == BrutalProtocolVersionV2 || (c.brutal.Version == 0 && c.brutal.GroupID > 0)
+	port := BrutalExchangePortV1
 	if wantV2 {
 		port = BrutalExchangePortV2
 	}
@@ -425,17 +433,19 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 	if exchangeTimeout <= 0 {
 		exchangeTimeout = DefaultTCPTimeout
 	}
+	deadline := time.Now().Add(exchangeTimeout)
 	if ctx != nil {
 		if dl, ok := ctx.Deadline(); ok {
-			_ = stream.SetDeadline(dl)
-		} else {
-			_ = stream.SetDeadline(time.Now().Add(exchangeTimeout))
+			deadline = dl
 		}
-	} else {
-		_ = stream.SetDeadline(time.Now().Add(exchangeTimeout))
 	}
+	_ = stream.SetDeadline(deadline)
 	conn := &clientConn{conn: &wrapStream{Conn: stream}, destination: M.Socksaddr{Fqdn: BrutalExchangeDomain, Port: port}}
 	defer conn.Close()
+	exchangeTimer := time.AfterFunc(time.Until(deadline), func() {
+		_ = conn.Close()
+	})
+	defer exchangeTimer.Stop()
 	gain := c.brutal.CwndGain
 	if gain == 0 {
 		gain = DefaultBrutalCwndGain

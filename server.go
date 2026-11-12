@@ -109,6 +109,10 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 		conn := &serverConn{ExtendedConn: bufio.NewExtendedConn(stream)}
 		if request.Destination.Fqdn == BrutalExchangeDomain {
 			_ = stream.SetDeadline(time.Now().Add(DefaultTCPTimeout))
+			exchangeTimer := time.AfterFunc(DefaultTCPTimeout, func() {
+				_ = stream.Close()
+			})
+			defer exchangeTimer.Stop()
 			isV2 := request.Destination.Port == BrutalExchangePortV2
 			req, err := ReadBrutalRequest(conn)
 			if err != nil {

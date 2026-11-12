@@ -294,5 +294,40 @@ func TestClientTunablesAndClosedState(t *testing.T) {
 	}
 }
 
+func TestClientConnReleasesHandshakeBuffersAndClientRef(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	client, err := NewClient(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	rawConn := &clientConn{
+		conn:             c1,
+		destination:      M.ParseSocksaddr("127.0.0.1:80"),
+		client:           client,
+		ctx:              context.Background(),
+		firstWriteBuffer: []byte("initial-handshake-bytes"),
+	}
+
+	// Simulate server sending statusSuccess followed by payload "ok"
+	go func() {
+		_, _ = c2.Write([]byte{statusSuccess, 'o', 'k'})
+	}()
+
+	buf := make([]byte, 2)
+	n, err := rawConn.Read(buf)
+	if err != nil || n != 2 || string(buf) != "ok" {
+		t.Fatalf("Read failed: n=%d, err=%v, buf=%q", n, err, buf)
+	}
+	if rawConn.firstWriteBuffer != nil || rawConn.client != nil || rawConn.ctx != nil {
+		t.Fatalf("expected firstWriteBuffer, client, and ctx to be cleared after responseRead")
+	}
+}
+
+
 
 

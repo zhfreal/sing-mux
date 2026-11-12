@@ -12,24 +12,27 @@ import (
 )
 
 const (
-	BrutalExchangeDomain = "_BrutalBwExchange"
-	BrutalExchangePortV2 = uint16(23302)      // Matches TCP_BRUTAL_VERSION sockopt to disambiguate v2 requests
-	BrutalMagicV2        = uint32(0x42525502) // "BRU\x02" in BigEndian
-	BrutalMinSpeedBPS    = 65536              // >= kernel MIN_PACING_RATE (62500 B/s)
-	BrutalMaxSpeedBPS    = 125000000000       // kernel MAX_PACING_RATE (1 Tbps)
-	BrutalMinCwndGain    = 5                  // kernel MIN_CWND_GAIN (0.5x)
-	BrutalMaxCwndGain    = 80                 // kernel MAX_CWND_GAIN (8.0x)
-	BrutalDefaultGain    = 20                 // kernel INIT_CWND_GAIN (2.0x)
-	BrutalV2ExtensionLen = 16                 // 4-byte magic + 8-byte groupID + 4-byte cwndGain
-	BrutalRequestLen     = 8                  // 8-byte receive rate
-	BrutalV1ResponseLen  = 9                  // 1-byte status + 8-byte receive rate
-	BrutalV2ResponseLen  = 25                 // 1-byte status + 8-byte receive rate + BrutalV2ExtensionLen
-	BrutalParamsV1Len    = 12                 // sizeof(tcp_brutal_params)
-	BrutalParamsV2Len    = 20                 // sizeof(tcp_brutal_params_v2)
-	FNV64Offset          = uint64(14695981039346656037)
-	FNV64Prime           = uint64(1099511628211)
-	TenantGroupIDBytes   = 8
-	TenantDefaultGroupID = uint64(1)
+	BrutalExchangeDomain    = "_BrutalBwExchange"
+	BrutalProtocolVersionV1 = uint16(1)
+	BrutalProtocolVersionV2 = uint16(2)
+	BrutalExchangePortV1    = uint16(0)
+	BrutalExchangePortV2    = uint16(23302)      // Matches TCP_BRUTAL_VERSION sockopt to disambiguate v2 requests
+	BrutalMagicV2           = uint32(0x42525502) // "BRU\x02" in BigEndian
+	BrutalMinSpeedBPS       = 65536              // >= kernel MIN_PACING_RATE (62500 B/s)
+	BrutalMaxSpeedBPS       = 125000000000       // kernel MAX_PACING_RATE (1 Tbps)
+	BrutalMinCwndGain       = 5                  // kernel MIN_CWND_GAIN (0.5x)
+	BrutalMaxCwndGain       = 80                 // kernel MAX_CWND_GAIN (8.0x)
+	BrutalDefaultGain       = 20                 // kernel INIT_CWND_GAIN (2.0x)
+	BrutalV2ExtensionLen    = 16                 // 4-byte magic + 8-byte groupID + 4-byte cwndGain
+	BrutalRequestLen        = 8                  // 8-byte receive rate
+	BrutalV1ResponseLen     = 9                  // 1-byte status + 8-byte receive rate
+	BrutalV2ResponseLen     = 25                 // 1-byte status + 8-byte receive rate + BrutalV2ExtensionLen
+	BrutalParamsV1Len       = 12                 // sizeof(tcp_brutal_params)
+	BrutalParamsV2Len       = 20                 // sizeof(tcp_brutal_params_v2)
+	FNV64Offset             = uint64(14695981039346656037)
+	FNV64Prime              = uint64(1099511628211)
+	TenantGroupIDBytes      = 8
+	TenantDefaultGroupID    = uint64(1)
 
 	BrutalStatusSuccess = 1
 	BrutalStatusError   = 0
@@ -52,6 +55,18 @@ const (
 	BrutalExtGroupIDEnd    = 12
 	BrutalExtCwndGainStart = 12
 	BrutalExtCwndGainEnd   = 16
+
+	BrutalParamsV1RateStart     = 0
+	BrutalParamsV1RateEnd       = 8
+	BrutalParamsV1CwndGainStart = 8
+	BrutalParamsV1CwndGainEnd   = 12
+
+	BrutalParamsV2RateStart     = 0
+	BrutalParamsV2RateEnd       = 8
+	BrutalParamsV2CwndGainStart = 8
+	BrutalParamsV2CwndGainEnd   = 12
+	BrutalParamsV2GroupIDStart  = 12
+	BrutalParamsV2GroupIDEnd    = 20
 )
 
 type BrutalExchangeRequest struct {
@@ -182,15 +197,15 @@ var nativeEndian = binary.NativeEndian
 
 func packBrutalParamsV2(rate uint64, cwndGain uint32, groupID uint64) [BrutalParamsV2Len]byte {
 	var b [BrutalParamsV2Len]byte
-	nativeEndian.PutUint64(b[0:8], rate)
-	nativeEndian.PutUint32(b[8:12], cwndGain)
-	nativeEndian.PutUint64(b[12:20], groupID)
+	nativeEndian.PutUint64(b[BrutalParamsV2RateStart:BrutalParamsV2RateEnd], rate)
+	nativeEndian.PutUint32(b[BrutalParamsV2CwndGainStart:BrutalParamsV2CwndGainEnd], cwndGain)
+	nativeEndian.PutUint64(b[BrutalParamsV2GroupIDStart:BrutalParamsV2GroupIDEnd], groupID)
 	return b
 }
 
 func packBrutalParamsV1(rate uint64, cwndGain uint32) [BrutalParamsV1Len]byte {
 	var b [BrutalParamsV1Len]byte
-	nativeEndian.PutUint64(b[0:8], rate)
-	nativeEndian.PutUint32(b[8:12], cwndGain)
+	nativeEndian.PutUint64(b[BrutalParamsV1RateStart:BrutalParamsV1RateEnd], rate)
+	nativeEndian.PutUint32(b[BrutalParamsV1CwndGainStart:BrutalParamsV1CwndGainEnd], cwndGain)
 	return b
 }

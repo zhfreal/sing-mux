@@ -16,11 +16,7 @@ import (
 	N "github.com/metacubex/sing/common/network"
 )
 
-const (
-	MaxHandshakeBufferCapacity = DefaultMaxHandshakeBufferCapacity
-	MaxStreamSwapRetries       = 2
-	StreamSwapDialTimeout      = DefaultStreamSwapDialTimeout
-)
+// Legacy aliases – removed; canonical constants are in client.go.
 
 func (c *clientConn) getMaxHandshakeBufferCapacity() int {
 	if c.client != nil && c.client.maxHandshakeBufferCapacity > 0 {
@@ -131,6 +127,9 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 
 	c.stateMu.Lock()
 	if c.client == nil || c.retryCount >= c.getMaxStreamSwapRetries() || c.responseRead {
+		c.client = nil
+		c.ctx = nil
+		c.firstWriteBuffer = nil
 		c.stateMu.Unlock()
 		return false, false
 	}
@@ -150,6 +149,11 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 	if err != nil {
 		c.stateMu.Lock()
 		c.retrying = false
+		if c.retryCount >= c.getMaxStreamSwapRetries() {
+			c.client = nil
+			c.ctx = nil
+			c.firstWriteBuffer = nil
+		}
 		c.retryCond.Broadcast()
 		c.stateMu.Unlock()
 		return false, false
@@ -161,6 +165,9 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 		newStream.Close()
 		c.stateMu.Lock()
 		c.retrying = false
+		c.client = nil
+		c.ctx = nil
+		c.firstWriteBuffer = nil
 		c.retryCond.Broadcast()
 		c.stateMu.Unlock()
 		return false, false
@@ -204,6 +211,8 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 		if err == nil {
 			c.responseRead = true
 			c.firstWriteBuffer = nil
+			c.client = nil
+			c.ctx = nil
 			c.stateMu.Unlock()
 			return readConn.Read(b)
 		}
@@ -264,6 +273,7 @@ func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 			c.firstWriteBuffer = append(c.firstWriteBuffer, b...)
 		} else {
 			c.client = nil
+			c.ctx = nil
 			c.firstWriteBuffer = nil
 		}
 	}
@@ -381,6 +391,7 @@ func (c *clientConn) Close() error {
 
 	c.stateMu.Lock()
 	c.client = nil
+	c.ctx = nil
 	c.firstWriteBuffer = nil
 	if c.retryCond != nil {
 		c.retryCond.Broadcast()
