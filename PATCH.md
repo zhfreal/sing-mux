@@ -1,6 +1,6 @@
 # Codebase Change Statement: sing-mux
 
-**Current Codebase:** `zhfreal/sing-mux` (`main-patched`, Tag: `v0.3.12-patch12` / `v0.3.12+patch12`)  
+**Current Codebase:** `zhfreal/sing-mux` (`main-patched`, Tag: `v0.3.12-patch13` / `v0.3.12+patch13`)  
 **Original Upstream Baseline:** `MetaCubeX/sing-mux` (Release `v0.3.12`, Git Commit `714fc2e099f227b7b4bc5a62880bcb5d3c8d5b2f`)  
 **Repository Location:** `./sing-mux-mine`  
 **Status:** Production-Ready, Race-Verified (`go test -race ./...` passing 100%)
@@ -13,6 +13,9 @@ This document specifies the complete architectural, functional, and performance 
 
 The modifications are structured into two distinct categories:
 1. **Type 1: New Features & Protocol Extensions**:
+   - Centralized default constant definitions (`DefaultSmuxMaxReceiveBuffer = 16 MiB`, `DefaultSmuxMaxStreamBuffer = 2 MiB`, `DefaultYamuxMaxStreamWindowSize = 2 MiB`, `DefaultTCPTimeout = 15s`, `DefaultMaxDrainRetries = 60`, `DefaultDrainRetryInterval = 500ms`).
+   - User-tunable session-level and stream-level buffer and window sizes (`MaxReceiveBuffer`, `MaxStreamBuffer`, `MaxStreamWindowSize`) with flexible unit string parsing (`ParseBytes`) supporting bytes, KB, MB, GB, and JSON unmarshaled float64 values.
+   - Make-before-break proactive lane replenishment (`replenishLane`), smooth soft-fallback routing during session retirement, and extended drain grace windows.
    - XMUX-style periodic session retirement (`HMaxReusableSecs`, `HMaxRequestTimes`, `CMaxReuseTimes`) with lock-free atomic CAS quota consumption and graceful active-stream draining.
    - TCP Brutal v2 protocol negotiation (`23302` / `0x42525502`, `TCP_BRUTAL_PARAMS_V2`) with backward-compatible v1 fallback and FNV-1a multi-tenant `GroupID` isolation.
    - Transparent pre-response stream failover (`firstWriteBuffer` handshake replay and targeted `Client.CloseSession` eviction).
@@ -66,6 +69,25 @@ The modifications are structured into two distinct categories:
   - `Client.DialContext` does not store the caller's dial `context.Context` on `clientConn`, preventing long-lived TCP streams from pinning dial-scoped context values in memory.
 * **Thread-Safe Half-Close Delegation (`clientConnWithCloseWrite`)**:
   - `clientConnWithCloseWrite.CloseWrite()` delegates via `N.CloseWrite(c.getConn())` so half-close operates safely even if `c.conn` was swapped during initial handshake retry.
+
+### 2.4 User-Tunable Buffer & Window Sizes (`session.go`, `client.go`, `server.go`)
+* **Exported Centralized Constants**:
+  - `DefaultSmuxMaxReceiveBuffer = 16 * 1024 * 1024` (16 MiB session shared receive buffer pool).
+  - `DefaultSmuxMaxStreamBuffer = 2 * 1024 * 1024` (2 MiB per-stream receive buffer).
+  - `DefaultYamuxMaxStreamWindowSize = 2 * 1024 * 1024` (2 MiB stream sliding window ceiling).
+* **Flexible Unit String & Numeric Parser (`ParseBytes`)**:
+  - Implemented exported `ParseBytes(v any) int` accepting integer types (`int`, `int32`, `int64`, `uint`, `uint32`, `uint64`), float types (`float64`, `float32` as produced by JSON unmarshaling into `interface{}`), and case-insensitive unit strings with spaces (`"16MB"`, `"16 MiB"`, `"2M"`, `"64KB"`, `"64k"`, `"1GB"`, `"1.5MB"`).
+* **Plumbing through Client & Service**:
+  - Added `MaxReceiveBuffer`, `MaxStreamBuffer`, and `MaxStreamWindowSize` to `Options`, `Client`, `ServiceOptions`, and `Service`.
+  - Dynamically configured `smux.Config` (`MaxReceiveBuffer`, `MaxStreamBuffer`) and `yamux.Config` (`MaxStreamWindowSize`) across `newClientSession` and `newServerSession`, automatically falling back to exported constants when values are zero or omitted.
+
+### 2.5 Make-Before-Break Lane Migration & Background Pre-Warming (`client.go`)
+* **Proactive Lane Replenishment (`replenishLane`)**:
+  - When sessions retire or session counts drop below `maxConnections`, launches asynchronous background pre-warming of replacement sessions (`replenishLane`) protected by `dialingCount` to establish fresh lanes before existing sessions expire.
+* **Smooth Soft Fallback**:
+  - In `Client.offer()`, if all active sessions are retired but unclosed sessions with remaining request/reuse quota exist, permits them as soft fallbacks so concurrent requests never stall waiting for a cold underlay dial during lane rotation.
+* **Extended Draining Window**:
+  - Increased `DefaultTCPTimeout` to 15s, `DefaultMaxDrainRetries` to 60, and `DefaultDrainRetryInterval` to 500ms (30s grace window) with a make-before-break guard ensuring at least one replacement session is established before draining retired sessions.
 
 ---
 
@@ -127,7 +149,7 @@ The modifications are structured into two distinct categories:
 | `brutal.go` | **Modified** | **Type 1** & **Type 2** | Brutal v2 port `23302` and magic `0x42525502`, `BrutalExchangeRequest` / `BrutalExchangeResponse` wire framing, FNV-1a `deriveTenantGroupID`, cross-platform `packBrutalParamsV1` / `packBrutalParamsV2`, rate/gain clamping, and named protocol constants. |
 | `brutal_linux.go` | **Modified** | **Type 1** & **Type 2** | Kernel `tcp_brutal_params_v2` support, `unwrapBrutalSyscallConn` multi-wrapper traversal, positive-only kernel version caching (`ver > 0`), and `EPERM` tolerance. |
 | `brutal_stub.go` | **Modified** | **Type 1** (Portability) | Updated `SetBrutalOptions` signature (`bps, groupID, gain`) for non-Linux targets. |
-| `client.go` | **Modified** | **Type 1** & **Type 2** | XMUX retirement options, Brutal v2 client negotiation with timer-backed deadline enforcement, `CloseSession` targeted eviction, single-pass `offer()` session selection, context-cancellation short-circuiting in `openStream`, and closed-client guards. |
+| `client.go` | **Modified** | **Type 1** & **Type 2** | XMUX retirement options, Brutal v2 client negotiation, tunable buffers (`MaxReceiveBuffer`, `MaxStreamBuffer`, `MaxStreamWindowSize`), make-before-break proactive replenishment (`replenishLane`), soft fallback routing, `CloseSession` targeted eviction, single-pass `offer()` session selection, context-cancellation short-circuiting in `openStream`, and closed-client guards. |
 | `client_conn.go` | **Modified** | **Type 1** & **Type 2** | Omission of `Upstream() any`, `firstWriteBuffer` handshake replay and prompt buffer/reference release, `readAccess` / `access` mutex separation, `len(p) < int(length)` bounds fix and short-buffer draining, zero-headroom reallocation, and single-buffer packet write coalescing. |
 | `client_conn_wait.go` | **Modified** | **Type 2** (Bugfix) | `readAccess` mutex synchronization and `readUint16` stack decoding in `WaitReadPacket`. |
 | `error.go` | **Added** | **Type 1** (New Feature) | Sentinel error definitions for session retirement, stream open failures, and Brutal parameter validation. |
@@ -135,9 +157,10 @@ The modifications are structured into two distinct categories:
 | `padding.go` | **Modified** | **Type 2** (Bugfix/Perf) | `writeAccess` mutex serialization, zero-data padding frame skipping, front/rear headroom reallocation in `WriteBuffer`, pre-sized vectorised buffer slice assembly, and lock-free `fastRandIntn` padding length selection. |
 | `protocol.go` | **Modified** | **Type 2** (Bugfix/Perf) | `readUint16` / `writeUint16` stack helpers, coalesced 2-byte header read in `ReadRequest`, exact `streamRequestLen` calculation, and named header length constants. |
 | `protocol_conn.go` | **Modified** | **Type 2** (Bugfix) | `c.access.Lock()` synchronization across initial handshake writes in `Write` and `WriteVectorised`, and exact `n = len(p)` write length accounting. |
-| `server.go` | **Modified** | **Type 1** & **Type 2** | Brutal v2 server negotiation and tenant group ID derivation, configurable `H2MuxIdleTimeout`, timer-backed Brutal control stream deadline, nil-safe logger checks, and immediate/deferred stream closure. |
+| `server.go` | **Modified** | **Type 1** & **Type 2** | Brutal v2 server negotiation and tenant group ID derivation, configurable `H2MuxIdleTimeout`, tunable buffers in `ServiceOptions`/`Service`, timer-backed Brutal control stream deadline, nil-safe logger checks, and immediate/deferred stream closure. |
 | `server_conn.go` | **Modified** | **Type 2** (Bugfix) | Defensive front headroom reallocation, `readAccess` / `access` mutex synchronization, `len(p) < int(length)` bounds fix and short-buffer draining, and single-buffer packet write coalescing. |
-| `session.go` | **Modified** | **Type 1** & **Type 2** | `sessionWrapper` retirement state and lock-free CAS quota consumption, `Range` parser, lock-free SplitMix64 `fastRandIntn`, and `h2MuxIdleTimeout` plumbing. |
+| `session.go` | **Modified** | **Type 1** & **Type 2** | Exported default constants (`DefaultSmuxMaxReceiveBuffer`, `DefaultSmuxMaxStreamBuffer`, `DefaultYamuxMaxStreamWindowSize`), `ParseBytes` unit string parser, dynamic buffer wiring in `smuxConfig` and `yaMuxConfig`, `sessionWrapper` retirement state and lock-free CAS quota consumption, `Range` parser, lock-free SplitMix64 `fastRandIntn`, and `h2MuxIdleTimeout` plumbing. |
+| `session_test.go` | **Added** | Testing | Unit tests for `ParseBytes` across all numeric and unit string variations, `smuxConfig` and `yaMuxConfig` defaults/overrides, and `NewClient`/`NewService` buffer option parsing. |
 | `brutal_test.go` | **Added** | Testing | Unit tests for Brutal v1/v2 wire serialization, fallback, corrupt/truncated responses, tenant group ID hashing, and closed-client drain behavior. |
 | `client_conn_test.go` | **Added** | Testing | Unit tests for `clientConnWithCloseWrite`, zero-headroom packet writes, closed-connection behavior, coalesced UDP writes, and handshake buffer/reference release. |
 | `client_test.go` | **Added** | Testing | Unit tests for `parseRange`, `sessionWrapper` retirement rollover, `wrapStream` close callbacks, and `CloseSession` isolation. |

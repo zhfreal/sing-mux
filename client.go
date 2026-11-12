@@ -5,6 +5,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/sing/common/bufio"
@@ -16,11 +17,11 @@ import (
 )
 
 const (
-	DefaultTCPTimeout                 = 500 * time.Millisecond
+	DefaultTCPTimeout                 = 15 * time.Second
 	DefaultMinStreams                 = 8
-	DefaultMaxDrainRetries            = 10
+	DefaultMaxDrainRetries            = 60
 	MaxDrainRetries                   = DefaultMaxDrainRetries
-	DefaultDrainRetryInterval         = 50 * time.Millisecond
+	DefaultDrainRetryInterval         = 500 * time.Millisecond
 	DrainRetryInterval                = DefaultDrainRetryInterval
 	DefaultStreamOpenRetries          = 2
 	DefaultMaxStreamSwapRetries       = 2
@@ -54,10 +55,15 @@ type Client struct {
 	access                     sync.Mutex
 	closed                     bool
 	connections                list.List[abstractSession]
+	dialMu                     sync.Mutex
+	dialingCount               atomic.Int32
 	brutal                     BrutalOptions
 	cMaxReuseTimes             Range
 	hMaxRequestTimes           Range
 	hMaxReusableSecs           Range
+	maxReceiveBuffer           int
+	maxStreamBuffer            int
+	maxStreamWindowSize        uint32
 }
 
 type Options struct {
@@ -80,6 +86,9 @@ type Options struct {
 	CMaxReuseTimes             any
 	HMaxRequestTimes           any
 	HMaxReusableSecs           any
+	MaxReceiveBuffer           any
+	MaxStreamBuffer            any
+	MaxStreamWindowSize        any
 }
 
 type BrutalOptions struct {
@@ -112,6 +121,9 @@ func NewClient(options Options) (*Client, error) {
 		cMaxReuseTimes:             parseRange(options.CMaxReuseTimes),
 		hMaxRequestTimes:           parseRange(options.HMaxRequestTimes),
 		hMaxReusableSecs:           parseRange(options.HMaxReusableSecs),
+		maxReceiveBuffer:           ParseBytes(options.MaxReceiveBuffer),
+		maxStreamBuffer:            ParseBytes(options.MaxStreamBuffer),
+		maxStreamWindowSize:        uint32(ParseBytes(options.MaxStreamWindowSize)),
 	}
 	if client.dialer == nil {
 		client.dialer = N.SystemDialer
@@ -268,9 +280,8 @@ func (c *Client) openStream(ctx context.Context) (net.Conn, error) {
 
 func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 	c.access.Lock()
-	defer c.access.Unlock()
-
 	if c.closed {
+		c.access.Unlock()
 		return nil, net.ErrClosed
 	}
 
@@ -279,6 +290,7 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 		validSessionCount int
 		firstAvailable    abstractSession
 		minSession        abstractSession
+		fallbackSession   abstractSession
 		minStreams        = math.MaxInt
 	)
 	for element := c.connections.Front(); element != nil; {
@@ -291,12 +303,17 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 			continue
 		}
 		if wrapper, ok := sess.(*sessionWrapper); ok && wrapper.isRetired(now) {
-			if wrapper.activeStreams.Load() <= 0 && wrapper.NumStreams() <= 0 {
+			// If hard quota is exhausted (leftRequests <= 0 or leftReuseTimes == 0) and idle, prune it
+			if (wrapper.leftRequests.Load() <= 0 || wrapper.leftReuseTimes.Load() == 0) && wrapper.activeStreams.Load() <= 0 && wrapper.NumStreams() <= 0 {
 				wrapper.Close()
 				nextElement := element.Next()
 				c.connections.Remove(element)
 				element = nextElement
 				continue
+			}
+			// Only allow soft fallback if request quota is NOT exhausted (i.e. only retired by hMaxReusableSecs timer)
+			if fallbackSession == nil && !sess.IsClosed() && wrapper.leftRequests.Load() > 0 && wrapper.leftReuseTimes.Load() != 0 && (c.maxStreams == 0 || sess.NumStreams() < c.maxStreams) {
+				fallbackSession = sess
 			}
 			element = element.Next()
 			continue
@@ -317,52 +334,50 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 		}
 		element = element.Next()
 	}
+
 	if c.brutal.Enabled {
 		if firstAvailable != nil {
-			if c.maxStreams > 0 && firstAvailable.NumStreams() >= c.maxStreams {
-				return c.offerNew(ctx)
+			if c.maxStreams == 0 || firstAvailable.NumStreams() < c.maxStreams {
+				if wrapper, ok := firstAvailable.(*sessionWrapper); ok {
+					wrapper.activeStreams.Add(1)
+					wrapper.ConsumeReuse()
+				}
+				if c.maxConnections > 0 && validSessionCount < c.maxConnections {
+					go c.replenishLane()
+				}
+				c.access.Unlock()
+				return firstAvailable, nil
 			}
-			if wrapper, ok := firstAvailable.(*sessionWrapper); ok {
-				wrapper.activeStreams.Add(1)
-				wrapper.ConsumeReuse()
-			}
-			return firstAvailable, nil
 		}
-		return c.offerNew(ctx)
-	}
-	if minSession == nil {
-		return c.offerNew(ctx)
-	}
-	if minStreams == 0 {
+	} else if minSession != nil {
 		if wrapper, ok := minSession.(*sessionWrapper); ok {
 			wrapper.activeStreams.Add(1)
 			wrapper.ConsumeReuse()
 		}
+		if c.maxConnections > 0 && validSessionCount < c.maxConnections {
+			go c.replenishLane()
+		}
+		c.access.Unlock()
 		return minSession, nil
 	}
-	if c.maxConnections > 0 {
-		if validSessionCount >= c.maxConnections || minStreams < c.minStreams {
-			if wrapper, ok := minSession.(*sessionWrapper); ok {
-				wrapper.activeStreams.Add(1)
-				wrapper.ConsumeReuse()
-			}
-			return minSession, nil
+
+	// If all active sessions are retired but an unclosed session remains, use it as a smooth soft fallback
+	// so the caller never stalls for a cold network dial while the replacement lane connects.
+	if fallbackSession != nil {
+		if wrapper, ok := fallbackSession.(*sessionWrapper); ok {
+			wrapper.activeStreams.Add(1)
+			wrapper.ConsumeReuse()
 		}
-	} else {
-		if c.maxStreams > 0 && minStreams < c.maxStreams {
-			if wrapper, ok := minSession.(*sessionWrapper); ok {
-				wrapper.activeStreams.Add(1)
-				wrapper.ConsumeReuse()
-			}
-			return minSession, nil
-		}
+		go c.replenishLane()
+		c.access.Unlock()
+		return fallbackSession, nil
 	}
+
+	c.access.Unlock()
 	return c.offerNew(ctx)
 }
 
-func (c *Client) offerNew(ctx context.Context) (abstractSession, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.tcpTimeout)
-	defer cancel()
+func (c *Client) dialNewSession(ctx context.Context) (abstractSession, error) {
 	conn, err := c.dialer.DialContext(ctx, N.NetworkTCP, Destination)
 	if err != nil {
 		return nil, err
@@ -381,7 +396,7 @@ func (c *Client) offerNew(ctx context.Context) (abstractSession, error) {
 	if c.padding {
 		conn = newPaddingConn(conn)
 	}
-	rawSession, err := newClientSession(conn, c.protocol, c.h2MuxIdleTimeout)
+	rawSession, err := newClientSession(conn, c.protocol, c.h2MuxIdleTimeout, c.maxReceiveBuffer, c.maxStreamBuffer, c.maxStreamWindowSize)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -391,7 +406,6 @@ func (c *Client) offerNew(ctx context.Context) (abstractSession, error) {
 		abstractSession: rawSession,
 		createdAt:       now,
 	}
-	wrapper.activeStreams.Store(1)
 	wrapper.leftRequests.Store(DefaultUnlimitedRequests)
 	if req := c.hMaxRequestTimes.Rand(); req > 0 {
 		wrapper.leftRequests.Store(int32(req))
@@ -403,17 +417,143 @@ func (c *Client) offerNew(ctx context.Context) (abstractSession, error) {
 	if secs := c.hMaxReusableSecs.Rand(); secs > 0 {
 		wrapper.unreusableAt = now.Add(time.Duration(secs) * time.Second)
 		wrapper.timer = time.AfterFunc(time.Duration(secs)*time.Second, func() {
-			c.maybeCloseSession(wrapper, InitialDrainRetryCount)
+			c.retireAndReplenish(wrapper)
 		})
 	}
-	session := wrapper
 	if c.brutal.Enabled {
-		err = c.brutalExchange(ctx, conn, session)
+		err = c.brutalExchange(ctx, conn, wrapper)
 		if err != nil {
 			conn.Close()
-			session.Close()
+			wrapper.Close()
 			return nil, E.Cause(err, "brutal exchange")
 		}
+	}
+	return wrapper, nil
+}
+
+func (c *Client) retireAndReplenish(s *sessionWrapper) {
+	if s == nil {
+		return
+	}
+	s.retired.Store(true)
+	go c.replenishLane()
+}
+
+func (c *Client) replenishLane() {
+	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return
+	}
+	now := time.Now()
+	var validSessionCount int
+	for element := c.connections.Front(); element != nil; element = element.Next() {
+		sess := element.Value
+		if sess.IsClosed() {
+			continue
+		}
+		if wrapper, ok := sess.(*sessionWrapper); ok && wrapper.isRetired(now) {
+			continue
+		}
+		validSessionCount++
+	}
+	target := c.maxConnections
+	if target <= 0 {
+		target = 1
+	}
+	if validSessionCount+int(c.dialingCount.Load()) >= target {
+		c.access.Unlock()
+		return
+	}
+	c.dialingCount.Add(1)
+	c.access.Unlock()
+
+	defer c.dialingCount.Add(-1)
+
+	timeout := c.tcpTimeout
+	if timeout <= 0 {
+		timeout = DefaultTCPTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	sess, err := c.dialNewSession(ctx)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Debug("sing-mux: replenishLane dial error: ", err)
+		}
+		return
+	}
+
+	c.access.Lock()
+	if c.closed {
+		sess.Close()
+		c.access.Unlock()
+		return
+	}
+	c.connections.PushBack(sess)
+	if c.logger != nil {
+		c.logger.Debug("sing-mux: proactive lane replenishment successful")
+	}
+
+	// Make-before-break: now that a fresh replacement lane is in place,
+	// clean up any retired sessions that have completed all their active streams.
+	var retiredToDrain []*sessionWrapper
+	for element := c.connections.Front(); element != nil; element = element.Next() {
+		if wrapper, ok := element.Value.(*sessionWrapper); ok && wrapper.isRetired(now) {
+			retiredToDrain = append(retiredToDrain, wrapper)
+		}
+	}
+	c.access.Unlock()
+
+	for _, retiredSess := range retiredToDrain {
+		c.maybeCloseSession(retiredSess, InitialDrainRetryCount)
+	}
+}
+
+func (c *Client) offerNew(ctx context.Context) (abstractSession, error) {
+	c.dialMu.Lock()
+	defer c.dialMu.Unlock()
+
+	// Double-check if another goroutine finished dialing an available session
+	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return nil, net.ErrClosed
+	}
+	now := time.Now()
+	for element := c.connections.Front(); element != nil; element = element.Next() {
+		sess := element.Value
+		if sess.IsClosed() {
+			continue
+		}
+		if wrapper, ok := sess.(*sessionWrapper); ok && wrapper.isRetired(now) {
+			continue
+		}
+		if sess.CanTakeNewRequest() {
+			if wrapper, ok := sess.(*sessionWrapper); ok {
+				wrapper.activeStreams.Add(1)
+				wrapper.ConsumeReuse()
+			}
+			c.access.Unlock()
+			return sess, nil
+		}
+	}
+	c.access.Unlock()
+
+	session, err := c.dialNewSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.closed {
+		session.Close()
+		return nil, net.ErrClosed
+	}
+	if wrapper, ok := session.(*sessionWrapper); ok {
+		wrapper.activeStreams.Add(1)
+		wrapper.ConsumeReuse()
 	}
 	c.connections.PushBack(session)
 	return session, nil
@@ -546,15 +686,45 @@ func (c *Client) maybeCloseSession(s *sessionWrapper, retries int) {
 	if !s.isRetired(time.Now()) || s.activeStreams.Load() > 0 {
 		return
 	}
+
+	maxRetries := c.maxDrainRetries
+	if maxRetries <= 0 {
+		maxRetries = MaxDrainRetries
+	}
+	interval := c.drainRetryInterval
+	if interval <= 0 {
+		interval = DrainRetryInterval
+	}
+
+	// Make-before-break safeguard:
+	// If the session was retired only by hMaxReusableSecs timer (not hard quota),
+	// ensure at least one valid, non-retired session exists in the pool before closing it,
+	// unless it has exhausted maxDrainRetries.
+	if s.leftRequests.Load() > 0 && s.leftReuseTimes.Load() != 0 && retries < maxRetries {
+		c.access.Lock()
+		now := time.Now()
+		var validSessions int
+		for el := c.connections.Front(); el != nil; el = el.Next() {
+			if !el.Value.IsClosed() {
+				if w, ok := el.Value.(*sessionWrapper); ok {
+					if !w.isRetired(now) {
+						validSessions++
+					}
+				} else {
+					validSessions++
+				}
+			}
+		}
+		c.access.Unlock()
+		if validSessions == 0 {
+			time.AfterFunc(interval, func() {
+				c.maybeCloseSession(s, retries+1)
+			})
+			return
+		}
+	}
+
 	if s.NumStreams() > 0 {
-		maxRetries := c.maxDrainRetries
-		if maxRetries <= 0 {
-			maxRetries = MaxDrainRetries
-		}
-		interval := c.drainRetryInterval
-		if interval <= 0 {
-			interval = DrainRetryInterval
-		}
 		if retries < maxRetries {
 			time.AfterFunc(interval, func() {
 				c.maybeCloseSession(s, retries+1)

@@ -21,21 +21,27 @@ type ServiceHandler interface {
 }
 
 type Service struct {
-	newStreamContext func(context.Context, net.Conn) context.Context
-	logger           logger.ContextLogger
-	handler          ServiceHandler
-	padding          bool
-	brutal           BrutalOptions
-	h2MuxIdleTimeout time.Duration
+	newStreamContext    func(context.Context, net.Conn) context.Context
+	logger              logger.ContextLogger
+	handler             ServiceHandler
+	padding             bool
+	brutal              BrutalOptions
+	h2MuxIdleTimeout    time.Duration
+	maxReceiveBuffer    int
+	maxStreamBuffer     int
+	maxStreamWindowSize uint32
 }
 
 type ServiceOptions struct {
-	NewStreamContext func(context.Context, net.Conn) context.Context
-	Logger           logger.ContextLogger
-	Handler          ServiceHandler
-	Padding          bool
-	Brutal           BrutalOptions
-	H2MuxIdleTimeout time.Duration
+	NewStreamContext    func(context.Context, net.Conn) context.Context
+	Logger              logger.ContextLogger
+	Handler             ServiceHandler
+	Padding             bool
+	Brutal              BrutalOptions
+	H2MuxIdleTimeout    time.Duration
+	MaxReceiveBuffer    any
+	MaxStreamBuffer     any
+	MaxStreamWindowSize any
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
@@ -47,12 +53,15 @@ func NewService(options ServiceOptions) (*Service, error) {
 		h2MuxIdleTimeout = DefaultH2MuxIdleTimeout
 	}
 	return &Service{
-		newStreamContext: options.NewStreamContext,
-		logger:           options.Logger,
-		handler:          options.Handler,
-		padding:          options.Padding,
-		brutal:           options.Brutal,
-		h2MuxIdleTimeout: h2MuxIdleTimeout,
+		newStreamContext:    options.NewStreamContext,
+		logger:              options.Logger,
+		handler:             options.Handler,
+		padding:             options.Padding,
+		brutal:              options.Brutal,
+		h2MuxIdleTimeout:    h2MuxIdleTimeout,
+		maxReceiveBuffer:    ParseBytes(options.MaxReceiveBuffer),
+		maxStreamBuffer:     ParseBytes(options.MaxStreamBuffer),
+		maxStreamWindowSize: uint32(ParseBytes(options.MaxStreamWindowSize)),
 	}, nil
 }
 
@@ -66,7 +75,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.M
 	} else if s.padding {
 		return E.New("non-padded connection rejected")
 	}
-	session, err := newServerSession(conn, request.Protocol, s.h2MuxIdleTimeout)
+	session, err := newServerSession(conn, request.Protocol, s.h2MuxIdleTimeout, s.maxReceiveBuffer, s.maxStreamBuffer, s.maxStreamWindowSize)
 	if err != nil {
 		return err
 	}

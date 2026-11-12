@@ -18,12 +18,12 @@ import (
 // loses the response.
 func TestYamuxWrapStreamCloseWriteKeepsReadOpen(t *testing.T) {
 	clientPipe, serverPipe := net.Pipe()
-	client, err := yamux.Client(clientPipe, yaMuxConfig(), nil)
+	client, err := yamux.Client(clientPipe, yaMuxConfig(0), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	server, err := yamux.Server(serverPipe, yaMuxConfig(), nil)
+	server, err := yamux.Server(serverPipe, yaMuxConfig(0), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
