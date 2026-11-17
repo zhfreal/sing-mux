@@ -9,9 +9,9 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/metacubex/sing/common/atomic"
 	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/sing/common/bufio"
 	E "github.com/metacubex/sing/common/exceptions"
