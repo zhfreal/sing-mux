@@ -1,6 +1,6 @@
 # Codebase Change Statement: sing-mux
 
-**Current Codebase:** `zhfreal/sing-mux` (`main-patched`, Tag: `v0.3.12-patch15` / `v0.3.12+patch15`)  
+**Current Codebase:** `zhfreal/sing-mux` (`main-patched`, Tag: `v0.3.12-patch16` / `v0.3.12+patch16`)  
 **Original Upstream Baseline:** `MetaCubeX/sing-mux` (Release `v0.3.12`, Git Commit `714fc2e099f227b7b4bc5a62880bcb5d3c8d5b2f`)  
 **Repository Location:** `./sing-mux-mine`  
 **Status:** Production-Ready, Race-Verified (`go test -race ./...` passing 100%)
@@ -168,4 +168,4 @@ The modifications are structured into two distinct categories:
 | `client_test.go` | **Added** | Testing | Unit tests for `parseRange`, `sessionWrapper` retirement rollover, `wrapStream` close callbacks, and `CloseSession` isolation. |
 | `padding_test.go` | **Added** | Testing | Unit tests verifying `paddingConn.Read` and `ReadBuffer` skip zero-data padded frames cleanly. |
 | `server_conn_test.go` | **Added** | Testing | Unit tests for server packet zero-headroom reallocation, nil-flusher HTTP/2 wrapper writes, and `len(p)` vs `cap(p)` short-buffer safety. |
-| `go.mod` / `go.sum` | **Modified** | **Dependencies** | Updated online replacements to `zhfreal/sing` (`v0.5.10-0.20261125005639-d6d53d30c901`), `zhfreal/smux` (`v1.5.51-0.20261125010243-29e5ac271551`), and `zhfreal/yamux` (`v0.0.0-20261125010246-c81cccbd5d0e`). |
+| `go.mod` / `go.sum` | **Modified** | **Dependencies** | Updated online replacements to `zhfreal/sing` (`v0.5.10-0.20261125005639-d6d53d30c901`), `zhfreal/smux` (`v1.5.51-0.20261125011022-d5b9372ce684`), and `zhfreal/yamux` (`v0.0.0-20261125010829-029265411adc`). |
