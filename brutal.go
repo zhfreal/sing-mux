@@ -134,18 +134,25 @@ func WriteBrutalResponse(writer io.Writer, resp BrutalExchangeResponse, ok bool,
 }
 
 func ReadBrutalResponse(reader io.Reader, wantV2 bool) (resp BrutalExchangeResponse, isV2 bool, err error) {
-	var head [BrutalV1ResponseLen]byte
-	if _, err = io.ReadFull(reader, head[:]); err != nil {
+	var status [1]byte
+	if _, err = io.ReadFull(reader, status[:]); err != nil {
 		return resp, false, err
 	}
-	if head[0] == BrutalStatusError {
+	if status[0] == BrutalStatusError {
 		msg, rErr := rw.ReadVString(reader)
 		if rErr != nil {
 			return resp, false, rErr
 		}
 		return resp, false, E.New("remote brutal error: ", msg)
 	}
-	resp.ReceiveBPS = binary.BigEndian.Uint64(head[BrutalV1RateStart:BrutalV1RateEnd])
+	if status[0] != BrutalStatusSuccess {
+		return resp, false, E.New("invalid brutal response status: ", status[0])
+	}
+	var rateBuf [BrutalV1RateEnd - BrutalV1RateStart]byte
+	if _, err = io.ReadFull(reader, rateBuf[:]); err != nil {
+		return resp, false, err
+	}
+	resp.ReceiveBPS = binary.BigEndian.Uint64(rateBuf[:])
 	if wantV2 {
 		var v2Buf [BrutalV2ExtensionLen]byte
 		// Use io.ReadFull to detect v2 extension.

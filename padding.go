@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
@@ -28,6 +29,7 @@ const (
 type paddingConn struct {
 	N.ExtendedConn
 	writeAccess      sync.Mutex
+	writePaddingDone atomic.Bool
 	readPadding      int
 	writePadding     int
 	readRemaining    int
@@ -100,6 +102,9 @@ func (c *paddingConn) Read(p []byte) (n int, err error) {
 }
 
 func (c *paddingConn) Write(p []byte) (n int, err error) {
+	if c.writePaddingDone.Load() {
+		return c.ExtendedConn.Write(p)
+	}
 	for pLen := len(p); pLen > 0; {
 		var data []byte
 		if pLen > MaxPaddingPayloadLen {
@@ -133,6 +138,9 @@ func (c *paddingConn) write(p []byte) (n int, err error) {
 		common.Must1(buffer.Write(p))
 		buffer.Extend(paddingLen)
 		_, err = c.ExtendedConn.Write(buffer.Bytes())
+		if c.writePadding >= kFirstPaddings {
+			c.writePaddingDone.Store(true)
+		}
 		c.writeAccess.Unlock()
 		if err == nil {
 			n = len(p)
@@ -196,6 +204,9 @@ func (c *paddingConn) ReadBuffer(buffer *buf.Buffer) error {
 }
 
 func (c *paddingConn) WriteBuffer(buffer *buf.Buffer) error {
+	if c.writePaddingDone.Load() {
+		return c.ExtendedConn.WriteBuffer(buffer)
+	}
 	c.writeAccess.Lock()
 	if c.writePadding < kFirstPaddings {
 		bufferLen := buffer.Len()
@@ -218,6 +229,9 @@ func (c *paddingConn) WriteBuffer(buffer *buf.Buffer) error {
 		binary.BigEndian.PutUint16(header[PaddingOriginalSizeLen:], uint16(paddingLen))
 		buffer.Extend(paddingLen)
 		err := c.ExtendedConn.WriteBuffer(buffer)
+		if c.writePadding >= kFirstPaddings {
+			c.writePaddingDone.Store(true)
+		}
 		c.writeAccess.Unlock()
 		return err
 	}
@@ -239,6 +253,9 @@ type vectorisedPaddingConn struct {
 }
 
 func (c *vectorisedPaddingConn) WriteVectorised(buffers []*buf.Buffer) error {
+	if c.writePaddingDone.Load() {
+		return c.writer.WriteVectorised(buffers)
+	}
 	c.writeAccess.Lock()
 	if c.writePadding < kFirstPaddings {
 		bufferLen := buf.LenMulti(buffers)
@@ -266,6 +283,9 @@ func (c *vectorisedPaddingConn) WriteVectorised(buffers []*buf.Buffer) error {
 		allBuffers = append(allBuffers, buffers...)
 		allBuffers = append(allBuffers, padding)
 		err := c.writer.WriteVectorised(allBuffers)
+		if c.writePadding >= kFirstPaddings {
+			c.writePaddingDone.Store(true)
+		}
 		c.writeAccess.Unlock()
 		return err
 	}

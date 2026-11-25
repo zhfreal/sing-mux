@@ -3,6 +3,7 @@ package mux
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/sing/common/bufio"
@@ -13,7 +14,7 @@ type protocolConn struct {
 	net.Conn
 	access         sync.Mutex
 	request        Request
-	requestWritten bool
+	requestWritten atomic.Bool
 }
 
 func newProtocolConn(conn net.Conn, request Request) net.Conn {
@@ -35,14 +36,15 @@ func newProtocolConn(conn net.Conn, request Request) net.Conn {
 }
 
 func (c *protocolConn) NeedHandshake() bool {
-	c.access.Lock()
-	defer c.access.Unlock()
-	return !c.requestWritten
+	return !c.requestWritten.Load()
 }
 
 func (c *protocolConn) Write(p []byte) (n int, err error) {
+	if c.requestWritten.Load() {
+		return c.Conn.Write(p)
+	}
 	c.access.Lock()
-	if c.requestWritten {
+	if c.requestWritten.Load() {
 		c.access.Unlock()
 		return c.Conn.Write(p)
 	}
@@ -50,7 +52,7 @@ func (c *protocolConn) Write(p []byte) (n int, err error) {
 	_, err = c.Conn.Write(buffer.Bytes())
 	buffer.Release()
 	if err == nil {
-		c.requestWritten = true
+		c.requestWritten.Store(true)
 		n = len(p)
 	}
 	c.access.Unlock()
@@ -67,8 +69,11 @@ type vectorisedProtocolConn struct {
 }
 
 func (c *vectorisedProtocolConn) WriteVectorised(buffers []*buf.Buffer) error {
+	if c.requestWritten.Load() {
+		return c.writer.WriteVectorised(buffers)
+	}
 	c.access.Lock()
-	if c.requestWritten {
+	if c.requestWritten.Load() {
 		c.access.Unlock()
 		return c.writer.WriteVectorised(buffers)
 	}
@@ -78,7 +83,7 @@ func (c *vectorisedProtocolConn) WriteVectorised(buffers []*buf.Buffer) error {
 	allBuffers = append(allBuffers, buffers...)
 	err := c.writer.WriteVectorised(allBuffers)
 	if err == nil {
-		c.requestWritten = true
+		c.requestWritten.Store(true)
 	}
 	c.access.Unlock()
 	return err

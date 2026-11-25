@@ -118,7 +118,7 @@ func EncodeRequest(request Request, payload []byte) *buf.Buffer {
 		common.Must(buffer.WriteByte(padByte))
 		if request.Padding {
 			binary.BigEndian.PutUint16(buffer.Extend(PaddingHeaderLen), paddingLen)
-			buffer.Extend(int(paddingLen))
+			clear(buffer.Extend(int(paddingLen)))
 		}
 	}
 	common.Must1(buffer.Write(payload))
@@ -159,9 +159,13 @@ func ReadStreamRequest(reader io.Reader) (*StreamRequest, error) {
 }
 
 func streamRequestLen(request StreamRequest) int {
+	destination := request.Destination
+	if request.PacketAddr && !destination.IsValid() {
+		destination = Destination
+	}
 	var rLen int
 	rLen += StreamFlagsLen
-	rLen += M.SocksaddrSerializer.AddrPortLen(request.Destination)
+	rLen += M.SocksaddrSerializer.AddrPortLen(destination)
 	return rLen
 }
 

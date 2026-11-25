@@ -1,6 +1,6 @@
 # Codebase Change Statement: sing-mux
 
-**Current Codebase:** `zhfreal/sing-mux` (`main-patched`, Tag: `v0.3.12-patch13` / `v0.3.12+patch13`)  
+**Current Codebase:** `zhfreal/sing-mux` (`main-patched`, Tag: `v0.3.12-patch15` / `v0.3.12+patch15`)  
 **Original Upstream Baseline:** `MetaCubeX/sing-mux` (Release `v0.3.12`, Git Commit `714fc2e099f227b7b4bc5a62880bcb5d3c8d5b2f`)  
 **Repository Location:** `./sing-mux-mine`  
 **Status:** Production-Ready, Race-Verified (`go test -race ./...` passing 100%)
@@ -131,14 +131,16 @@ The modifications are structured into two distinct categories:
   - `Client.maybeCloseSession` exits immediately when `c.closed` is true so closed clients do not schedule background drain timers.
 
 ### 3.5 Zero-Data Padding Frame Handling, Zero-Alloc Helpers & Lock-Free PRNG (`padding.go`, `protocol.go`, `session.go`, `client.go`)
-* **Zero-Data Padding Frame Skipping (`padding.go`)**:
+* **Zero-Data Padding Frame Skipping & Post-Write Flag Ordering (`padding.go`)**:
   - `paddingConn.Read` and `paddingConn.ReadBuffer` loop past padded frames with `originalDataSize == 0` (draining their padding bytes on the next iteration) instead of returning a spurious `(0, nil)` EOF-like read.
-* **Stack Integer Helpers & Coalesced Header Reads (`protocol.go`)**:
-  - Replaces reflection-based `encoding/binary.Read` and `binary.Write` with stack-backed `readUint16` / `writeUint16` and direct `binary.BigEndian.PutUint16` operations, and reads the 2-byte `Request` header (`version`, `protocol`) in a single `io.ReadFull` call.
-  - Fixes `streamRequestLen` to compute exact `StreamFlagsLen + AddrPortLen` without an unused extra byte.
-* **Single-Pass Session Selection & Lock-Free SplitMix64 PRNG (`client.go`, `session.go`, `padding.go`, `protocol.go`)**:
+  - Moved `c.writePaddingDone.Store(true)` on the 16th padded write in `write`, `WriteBuffer`, and `WriteVectorised` to occur *after* the underlying `ExtendedConn` write completes (still under `c.writeAccess`), preventing concurrent writers from bypassing `writeAccess` and racing with packet #16.
+* **Stack Integer Helpers, Buffer Clearing & Exact Header Accounting (`protocol.go`)**:
+  - Replaces reflection-based `encoding/binary.Read` and `binary.Write` with stack-backed `readUint16` / `writeUint16` and direct `binary.BigEndian.PutUint16` operations, clears padding bytes explicitly, and reads the 2-byte `Request` header (`version`, `protocol`) in a single `io.ReadFull` call.
+  - Fixes `streamRequestLen` to compute exact `StreamFlagsLen + AddrPortLen` (including `PacketAddr`) without an unused extra byte.
+* **Single-Pass Session Selection, Lock-Free SplitMix64 PRNG & v15 Bounds/Concurrency Hardening (`client.go`, `client_conn.go`, `server.go`, `server_conn.go`, `protocol_conn.go`, `session.go`, `brutal.go`, `brutal_linux.go`, `h2mux.go`)**:
   - `Client.offer()` traverses `c.connections` in a single linked-list pass without allocating intermediate session slices via `common.Filter`.
-  - Replaces global mutex-contended `math/rand.Intn` calls with lock-free atomic SplitMix64 `fastRandIntn`.
+  - Replaces global mutex-contended `math/rand.Intn` calls with lock-free atomic SplitMix64 `fastRandIntn`, and adds bounds guards in `Range.Rand`/`ParseBytes`.
+  - Hardened `ReadBrutalResponse` status-first framing, 32-depth cycle-safe `unwrapBrutalSyscallConn`, `clampUint32`, `> 0` BPS negotiation and expired deadline checks, `tcpTimeout > 0` + `cancel()` in `h2mux.go`, atomic fast paths, `math.MaxUint16` UDP length check on `clientPacketAddrConn.WritePacket`, and `s.draining` race cleanup in `Client.maybeCloseSession`.
 
 ---
 
@@ -166,3 +168,4 @@ The modifications are structured into two distinct categories:
 | `client_test.go` | **Added** | Testing | Unit tests for `parseRange`, `sessionWrapper` retirement rollover, `wrapStream` close callbacks, and `CloseSession` isolation. |
 | `padding_test.go` | **Added** | Testing | Unit tests verifying `paddingConn.Read` and `ReadBuffer` skip zero-data padded frames cleanly. |
 | `server_conn_test.go` | **Added** | Testing | Unit tests for server packet zero-headroom reallocation, nil-flusher HTTP/2 wrapper writes, and `len(p)` vs `cap(p)` short-buffer safety. |
+| `go.mod` / `go.sum` | **Modified** | **Dependencies** | Updated online replacements to `zhfreal/sing` (`v0.5.10-0.20261125005639-d6d53d30c901`), `zhfreal/smux` (`v1.5.51-0.20261125010243-29e5ac271551`), and `zhfreal/yamux` (`v0.0.0-20261125010246-c81cccbd5d0e`). |

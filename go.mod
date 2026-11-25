@@ -12,8 +12,8 @@ require (
 
 require golang.org/x/text v0.44.0 // indirect
 
-replace github.com/metacubex/sing => github.com/zhfreal/sing v0.5.10-0.20261117034331-d7da6af0cb5d
+replace github.com/metacubex/sing => github.com/zhfreal/sing v0.5.10-0.20261125005639-d6d53d30c901
 
-replace github.com/metacubex/smux => github.com/zhfreal/smux v1.5.51-0.20261117034334-cfeeefd324e7
+replace github.com/metacubex/smux => github.com/zhfreal/smux v1.5.51-0.20261125010243-29e5ac271551
 
-replace github.com/metacubex/yamux => github.com/zhfreal/yamux v0.0.0-20261117034336-61c33d890712
+replace github.com/metacubex/yamux => github.com/zhfreal/yamux v0.0.0-20261125010246-c81cccbd5d0e

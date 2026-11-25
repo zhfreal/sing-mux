@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -33,6 +34,7 @@ type sessionWrapper struct {
 	leftReuseTimes atomic.Int32
 	activeStreams  atomic.Int32
 	retired        atomic.Bool
+	draining       atomic.Bool
 	closed         atomic.Bool
 }
 
@@ -143,7 +145,11 @@ func (r Range) Rand() int {
 	if r.Min > r.Max {
 		return r.Max
 	}
-	return r.Min + fastRandIntn(r.Max-r.Min+1)
+	span := uint64(r.Max) - uint64(r.Min)
+	if span >= uint64(math.MaxInt) {
+		return r.Min + fastRandIntn(math.MaxInt)
+	}
+	return r.Min + fastRandIntn(int(span)+1)
 }
 
 func parseRange(v any) Range {
@@ -216,21 +222,37 @@ func ParseBytes(v any) int {
 		}
 		return 0
 	case uint:
+		if uint64(val) > math.MaxInt {
+			return math.MaxInt
+		}
 		return int(val)
 	case uint32:
+		if uint64(val) > math.MaxInt {
+			return math.MaxInt
+		}
 		return int(val)
 	case uint64:
+		if val > math.MaxInt {
+			return math.MaxInt
+		}
 		return int(val)
 	case float64:
-		if val > 0 {
-			return int(val)
+		if math.IsNaN(val) || math.IsInf(val, 0) || val <= 0 {
+			return 0
 		}
-		return 0
+		if val >= float64(math.MaxInt) {
+			return math.MaxInt
+		}
+		return int(val)
 	case float32:
-		if val > 0 {
-			return int(val)
+		f := float64(val)
+		if math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 {
+			return 0
 		}
-		return 0
+		if f >= float64(math.MaxInt) {
+			return math.MaxInt
+		}
+		return int(f)
 	case *int:
 		if val != nil {
 			return ParseBytes(*val)
@@ -289,10 +311,14 @@ func ParseBytes(v any) int {
 		}
 
 		num, err := strconv.ParseFloat(s, 64)
-		if err != nil || num <= 0 {
+		if err != nil || math.IsNaN(num) || math.IsInf(num, 0) || num <= 0 {
 			return 0
 		}
-		return int(num * float64(multiplier))
+		prod := num * float64(multiplier)
+		if math.IsNaN(prod) || math.IsInf(prod, 0) || prod >= float64(math.MaxInt) {
+			return math.MaxInt
+		}
+		return int(prod)
 	case fmt.Stringer:
 		return ParseBytes(val.String())
 	default:

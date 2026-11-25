@@ -101,6 +101,17 @@ type BrutalOptions struct {
 	AllowClientGroupID bool
 }
 
+
+func clampUint32(v int) uint32 {
+	if v <= 0 {
+		return 0
+	}
+	if uint64(v) > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
+}
+
 func NewClient(options Options) (*Client, error) {
 	client := &Client{
 		dialer:                     options.Dialer,
@@ -123,7 +134,7 @@ func NewClient(options Options) (*Client, error) {
 		hMaxReusableSecs:           parseRange(options.HMaxReusableSecs),
 		maxReceiveBuffer:           ParseBytes(options.MaxReceiveBuffer),
 		maxStreamBuffer:            ParseBytes(options.MaxStreamBuffer),
-		maxStreamWindowSize:        uint32(ParseBytes(options.MaxStreamWindowSize)),
+		maxStreamWindowSize:        clampUint32(ParseBytes(options.MaxStreamWindowSize)),
 	}
 	if client.dialer == nil {
 		client.dialer = N.SystemDialer
@@ -296,7 +307,7 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 	for element := c.connections.Front(); element != nil; {
 		sess := element.Value
 		if sess.IsClosed() {
-			sess.Close()
+			go sess.Close()
 			nextElement := element.Next()
 			c.connections.Remove(element)
 			element = nextElement
@@ -305,7 +316,7 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 		if wrapper, ok := sess.(*sessionWrapper); ok && wrapper.isRetired(now) {
 			// If hard quota is exhausted (leftRequests <= 0 or leftReuseTimes == 0) and idle, prune it
 			if (wrapper.leftRequests.Load() <= 0 || wrapper.leftReuseTimes.Load() == 0) && wrapper.activeStreams.Load() <= 0 && wrapper.NumStreams() <= 0 {
-				wrapper.Close()
+				go wrapper.Close()
 				nextElement := element.Next()
 				c.connections.Remove(element)
 				element = nextElement
@@ -342,7 +353,7 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 					wrapper.activeStreams.Add(1)
 					wrapper.ConsumeReuse()
 				}
-				if c.maxConnections > 0 && validSessionCount < c.maxConnections {
+				if c.maxConnections > 0 && validSessionCount+int(c.dialingCount.Load()) < c.maxConnections {
 					go c.replenishLane()
 				}
 				c.access.Unlock()
@@ -354,7 +365,7 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 			wrapper.activeStreams.Add(1)
 			wrapper.ConsumeReuse()
 		}
-		if c.maxConnections > 0 && validSessionCount < c.maxConnections {
+		if c.maxConnections > 0 && validSessionCount+int(c.dialingCount.Load()) < c.maxConnections {
 			go c.replenishLane()
 		}
 		c.access.Unlock()
@@ -368,7 +379,9 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 			wrapper.activeStreams.Add(1)
 			wrapper.ConsumeReuse()
 		}
-		go c.replenishLane()
+		if c.dialingCount.Load() == 0 {
+			go c.replenishLane()
+		}
 		c.access.Unlock()
 		return fallbackSession, nil
 	}
@@ -436,7 +449,10 @@ func (c *Client) retireAndReplenish(s *sessionWrapper) {
 		return
 	}
 	s.retired.Store(true)
-	go c.replenishLane()
+	go func() {
+		c.replenishLane()
+		c.maybeCloseSession(s, InitialDrainRetryCount)
+	}()
 }
 
 func (c *Client) replenishLane() {
@@ -497,9 +513,10 @@ func (c *Client) replenishLane() {
 
 	// Make-before-break: now that a fresh replacement lane is in place,
 	// clean up any retired sessions that have completed all their active streams.
+	nowAfterDial := time.Now()
 	var retiredToDrain []*sessionWrapper
 	for element := c.connections.Front(); element != nil; element = element.Next() {
-		if wrapper, ok := element.Value.(*sessionWrapper); ok && wrapper.isRetired(now) {
+		if wrapper, ok := element.Value.(*sessionWrapper); ok && wrapper.isRetired(nowAfterDial) {
 			retiredToDrain = append(retiredToDrain, wrapper)
 		}
 	}
@@ -582,7 +599,11 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 	_ = stream.SetDeadline(deadline)
 	conn := &clientConn{conn: &wrapStream{Conn: stream}, destination: M.Socksaddr{Fqdn: BrutalExchangeDomain, Port: port}}
 	defer conn.Close()
-	exchangeTimer := time.AfterFunc(time.Until(deadline), func() {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return context.DeadlineExceeded
+	}
+	exchangeTimer := time.AfterFunc(remaining, func() {
 		_ = conn.Close()
 	})
 	defer exchangeTimer.Stop()
@@ -604,7 +625,7 @@ func (c *Client) brutalExchange(ctx context.Context, sessionConn net.Conn, sessi
 		return err
 	}
 	sendBPS := c.brutal.SendBPS
-	if resp.ReceiveBPS < sendBPS {
+	if resp.ReceiveBPS > 0 && (sendBPS == 0 || resp.ReceiveBPS < sendBPS) {
 		sendBPS = resp.ReceiveBPS
 	}
 	groupID := c.brutal.GroupID
@@ -674,6 +695,14 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) maybeCloseSession(s *sessionWrapper, retries int) {
+	rescheduled := false
+	if retries > InitialDrainRetryCount && s != nil {
+		defer func() {
+			if !rescheduled {
+				s.draining.Store(false)
+			}
+		}()
+	}
 	c.access.Lock()
 	closed := c.closed
 	c.access.Unlock()
@@ -683,8 +712,22 @@ func (c *Client) maybeCloseSession(s *sessionWrapper, retries int) {
 	if s == nil || s.IsClosed() {
 		return
 	}
-	if !s.isRetired(time.Now()) || s.activeStreams.Load() > 0 {
+	if !s.isRetired(time.Now()) {
 		return
+	}
+	if s.activeStreams.Load() > 0 {
+		if retries > InitialDrainRetryCount {
+			s.draining.Store(false)
+			if s.activeStreams.Load() == 0 && s.draining.CompareAndSwap(false, true) {
+				// Active stream closed in the narrow window before draining was cleared;
+				// keep draining under the newly claimed draining flag.
+			} else {
+				rescheduled = true // draining is already cleared or claimed by onClose
+				return
+			}
+		} else {
+			return
+		}
 	}
 
 	maxRetries := c.maxDrainRetries
@@ -717,6 +760,12 @@ func (c *Client) maybeCloseSession(s *sessionWrapper, retries int) {
 		}
 		c.access.Unlock()
 		if validSessions == 0 {
+			if retries == InitialDrainRetryCount {
+				if !s.draining.CompareAndSwap(false, true) {
+					return
+				}
+			}
+			rescheduled = true
 			time.AfterFunc(interval, func() {
 				c.maybeCloseSession(s, retries+1)
 			})
@@ -726,6 +775,12 @@ func (c *Client) maybeCloseSession(s *sessionWrapper, retries int) {
 
 	if s.NumStreams() > 0 {
 		if retries < maxRetries {
+			if retries == InitialDrainRetryCount {
+				if !s.draining.CompareAndSwap(false, true) {
+					return
+				}
+			}
+			rescheduled = true
 			time.AfterFunc(interval, func() {
 				c.maybeCloseSession(s, retries+1)
 			})
@@ -743,11 +798,11 @@ func (c *Client) maybeCloseSession(s *sessionWrapper, retries int) {
 	if c.logger != nil {
 		c.logger.Debug("sing-mux: closing retired session, NumStreams=0")
 	}
-	_ = s.Close()
 	for element := c.connections.Front(); element != nil; element = element.Next() {
 		if element.Value == s {
 			c.connections.Remove(element)
 			break
 		}
 	}
+	go s.Close()
 }

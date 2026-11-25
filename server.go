@@ -61,7 +61,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 		h2MuxIdleTimeout:    h2MuxIdleTimeout,
 		maxReceiveBuffer:    ParseBytes(options.MaxReceiveBuffer),
 		maxStreamBuffer:     ParseBytes(options.MaxStreamBuffer),
-		maxStreamWindowSize: uint32(ParseBytes(options.MaxStreamWindowSize)),
+		maxStreamWindowSize: clampUint32(ParseBytes(options.MaxStreamWindowSize)),
 	}, nil
 }
 
@@ -86,7 +86,10 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.M
 			if aErr != nil {
 				return aErr
 			}
-			streamCtx := s.newStreamContext(ctx, stream)
+			streamCtx := ctx
+			if s.newStreamContext != nil {
+				streamCtx = s.newStreamContext(ctx, stream)
+			}
 			go func() {
 				hErr := s.newConnection(streamCtx, conn, stream, metadata)
 				if hErr != nil && s.logger != nil {
@@ -136,7 +139,7 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 			}
 			clientReceiveBPS := req.ReceiveBPS
 			sendBPS := s.brutal.SendBPS
-			if clientReceiveBPS < sendBPS {
+			if clientReceiveBPS > 0 && (sendBPS == 0 || clientReceiveBPS < sendBPS) {
 				sendBPS = clientReceiveBPS
 			}
 			var groupID uint64

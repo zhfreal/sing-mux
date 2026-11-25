@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -54,8 +56,11 @@ type clientConn struct {
 	retryCond        *sync.Cond
 	retrying         bool
 	destination      M.Socksaddr
-	requestWritten   bool
-	responseRead     bool
+	requestWritten       bool
+	responseRead         bool
+	requestWrittenAtomic atomic.Bool
+	responseReadAtomic   atomic.Bool
+	closedAtomic         atomic.Bool
 
 	client           *Client
 	ctx              context.Context
@@ -135,15 +140,17 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 	}
 	c.retryCount++
 	c.requestWritten = false
+	c.requestWrittenAtomic.Store(false)
 	c.retrying = true
 	client := c.client
+	dialTimeout := c.getStreamSwapDialTimeout()
 	c.stateMu.Unlock()
 
 	if sess := getSessionFromConn(failedConn); sess != nil {
 		client.CloseSession(sess)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), c.getStreamSwapDialTimeout())
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 	newStream, err := client.openStream(ctx)
 	if err != nil {
@@ -179,6 +186,12 @@ func (c *clientConn) trySwapConnection(failedConn net.Conn) (swapped bool, ok bo
 }
 
 func (c *clientConn) Read(b []byte) (n int, err error) {
+	if c.responseReadAtomic.Load() {
+		if c.closedAtomic.Load() {
+			return 0, net.ErrClosed
+		}
+		return c.getConn().Read(b)
+	}
 	c.lazyInit()
 	for {
 		c.stateMu.Lock()
@@ -210,6 +223,7 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 		c.responseReadCond.Broadcast()
 		if err == nil {
 			c.responseRead = true
+			c.responseReadAtomic.Store(true)
 			c.firstWriteBuffer = nil
 			c.client = nil
 			c.ctx = nil
@@ -266,6 +280,12 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
+	if !isReplay && c.responseReadAtomic.Load() && c.requestWrittenAtomic.Load() {
+		if c.closedAtomic.Load() {
+			return 0, net.ErrClosed
+		}
+		return c.getConn().Write(b)
+	}
 	c.lazyInit()
 	c.stateMu.Lock()
 	if !isReplay && !c.responseRead && c.client != nil && c.retryCount < c.getMaxStreamSwapRetries() {
@@ -348,6 +368,7 @@ func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 		c.requestWriteCond.Broadcast()
 		if err == nil {
 			c.requestWritten = true
+			c.requestWrittenAtomic.Store(true)
 			if isReplay {
 				c.retrying = false
 				c.retryCond.Broadcast()
@@ -386,6 +407,7 @@ func (c *clientConn) Close() error {
 		return nil
 	}
 	c.closed = true
+	c.closedAtomic.Store(true)
 	conn := c.conn
 	c.connMu.Unlock()
 
@@ -530,6 +552,9 @@ func (c *clientPacketConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *clientPacketConn) writeRequest(payload []byte) (n int, err error) {
+	if len(payload) > math.MaxUint16 {
+		return 0, io.ErrShortWrite
+	}
 	request := StreamRequest{
 		Network:     N.NetworkUDP,
 		Destination: c.destination,
@@ -557,6 +582,9 @@ func (c *clientPacketConn) writeRequest(payload []byte) (n int, err error) {
 }
 
 func (c *clientPacketConn) Write(b []byte) (n int, err error) {
+	if len(b) > math.MaxUint16 {
+		return 0, io.ErrShortWrite
+	}
 	c.access.Lock()
 	defer c.access.Unlock()
 	if !c.requestWritten {
@@ -593,6 +621,10 @@ func (c *clientPacketConn) ReadBuffer(buffer *buf.Buffer) (err error) {
 }
 
 func (c *clientPacketConn) WriteBuffer(buffer *buf.Buffer) error {
+	if buffer.Len() > math.MaxUint16 {
+		buffer.Release()
+		return io.ErrShortWrite
+	}
 	c.access.Lock()
 	defer c.access.Unlock()
 	if !c.requestWritten {
@@ -639,6 +671,9 @@ func (c *clientPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 }
 
 func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if len(p) > math.MaxUint16 {
+		return 0, io.ErrShortWrite
+	}
 	c.access.Lock()
 	defer c.access.Unlock()
 	if !c.requestWritten {
@@ -743,6 +778,9 @@ func (c *clientPacketAddrConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 }
 
 func (c *clientPacketAddrConn) writeRequest(payload []byte, destination M.Socksaddr) (n int, err error) {
+	if len(payload) > math.MaxUint16 {
+		return 0, io.ErrShortWrite
+	}
 	request := StreamRequest{
 		Network:     N.NetworkUDP,
 		Destination: c.destination,
@@ -775,6 +813,9 @@ func (c *clientPacketAddrConn) writeRequest(payload []byte, destination M.Socksa
 }
 
 func (c *clientPacketAddrConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if len(p) > math.MaxUint16 {
+		return 0, io.ErrShortWrite
+	}
 	c.access.Lock()
 	defer c.access.Unlock()
 	destination := M.SocksaddrFromNet(addr)
@@ -821,6 +862,10 @@ func (c *clientPacketAddrConn) ReadPacket(buffer *buf.Buffer) (destination M.Soc
 }
 
 func (c *clientPacketAddrConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	if buffer.Len() > math.MaxUint16 {
+		buffer.Release()
+		return io.ErrShortWrite
+	}
 	c.access.Lock()
 	defer c.access.Unlock()
 	if !c.requestWritten {

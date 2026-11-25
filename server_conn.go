@@ -3,8 +3,10 @@ package mux
 import (
 	"encoding/binary"
 	"io"
+	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/buf"
@@ -15,14 +17,13 @@ import (
 
 type serverConn struct {
 	N.ExtendedConn
-	access          sync.Mutex
-	responseWritten bool
+	access                sync.Mutex
+	responseWritten       bool
+	responseWrittenAtomic atomic.Bool
 }
 
 func (c *serverConn) NeedHandshake() bool {
-	c.access.Lock()
-	defer c.access.Unlock()
-	return !c.responseWritten
+	return !c.responseWrittenAtomic.Load()
 }
 
 func (c *serverConn) HandshakeFailure(err error) error {
@@ -39,6 +40,9 @@ func (c *serverConn) HandshakeFailure(err error) error {
 }
 
 func (c *serverConn) Write(b []byte) (n int, err error) {
+	if c.responseWrittenAtomic.Load() {
+		return c.ExtendedConn.Write(b)
+	}
 	c.access.Lock()
 	if c.responseWritten {
 		c.access.Unlock()
@@ -56,11 +60,15 @@ func (c *serverConn) Write(b []byte) (n int, err error) {
 		return
 	}
 	c.responseWritten = true
+	c.responseWrittenAtomic.Store(true)
 	c.access.Unlock()
 	return len(b), nil
 }
 
 func (c *serverConn) WriteBuffer(buffer *buf.Buffer) error {
+	if c.responseWrittenAtomic.Load() {
+		return c.ExtendedConn.WriteBuffer(buffer)
+	}
 	c.access.Lock()
 	if c.responseWritten {
 		c.access.Unlock()
@@ -74,15 +82,17 @@ func (c *serverConn) WriteBuffer(buffer *buf.Buffer) error {
 		buffer = newBuf
 	}
 	buffer.ExtendHeader(ResponseStatusHeaderLen)[0] = statusSuccess
-	c.responseWritten = true
+	err := c.ExtendedConn.WriteBuffer(buffer)
+	if err == nil {
+		c.responseWritten = true
+		c.responseWrittenAtomic.Store(true)
+	}
 	c.access.Unlock()
-	return c.ExtendedConn.WriteBuffer(buffer)
+	return err
 }
 
 func (c *serverConn) FrontHeadroom() int {
-	c.access.Lock()
-	defer c.access.Unlock()
-	if !c.responseWritten {
+	if !c.responseWrittenAtomic.Load() {
 		return ResponseStatusHeaderLen
 	}
 	return 0
@@ -139,6 +149,10 @@ func (c *serverPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksad
 }
 
 func (c *serverPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	if buffer.Len() > math.MaxUint16 {
+		buffer.Release()
+		return io.ErrShortWrite
+	}
 	c.access.Lock()
 	defer c.access.Unlock()
 	needed := PacketLengthHeaderLen
@@ -177,6 +191,9 @@ func (c *serverPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 }
 
 func (c *serverPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if len(p) > math.MaxUint16 {
+		return 0, io.ErrShortWrite
+	}
 	c.access.Lock()
 	defer c.access.Unlock()
 	needed := PacketLengthHeaderLen + len(p)
@@ -266,6 +283,9 @@ func (c *serverPacketAddrConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 }
 
 func (c *serverPacketAddrConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if len(p) > math.MaxUint16 {
+		return 0, io.ErrShortWrite
+	}
 	c.access.Lock()
 	defer c.access.Unlock()
 	destination := M.SocksaddrFromNet(addr)
@@ -312,6 +332,10 @@ func (c *serverPacketAddrConn) ReadPacket(buffer *buf.Buffer) (destination M.Soc
 }
 
 func (c *serverPacketAddrConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	if buffer.Len() > math.MaxUint16 {
+		buffer.Release()
+		return io.ErrShortWrite
+	}
 	c.access.Lock()
 	defer c.access.Unlock()
 	addrPortLen := M.SocksaddrSerializer.AddrPortLen(destination)

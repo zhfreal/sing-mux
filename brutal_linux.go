@@ -56,23 +56,25 @@ func getKernelBrutalVersion(fd int) int {
 }
 
 func unwrapBrutalSyscallConn(conn net.Conn) (syscall.Conn, bool) {
-	for c := conn; c != nil; {
+	c := conn
+	for depth := 0; c != nil && depth < 32; depth++ {
 		if sc, ok := c.(syscall.Conn); ok {
 			return sc, true
 		}
+		var next net.Conn
 		if w, ok := c.(interface{ RawConn() net.Conn }); ok {
-			c = w.RawConn()
+			next = w.RawConn()
 		} else if w, ok := c.(interface{ NetConn() net.Conn }); ok {
-			c = w.NetConn()
+			next = w.NetConn()
 		} else if w, ok := c.(interface{ Upstream() any }); ok {
-			if next, ok := w.Upstream().(net.Conn); ok {
-				c = next
-			} else {
-				break
+			if u, ok := w.Upstream().(net.Conn); ok {
+				next = u
 			}
-		} else {
+		}
+		if next == nil || next == c {
 			break
 		}
+		c = next
 	}
 	return common.Cast[syscall.Conn](conn)
 }
