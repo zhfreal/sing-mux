@@ -27,10 +27,11 @@ const (
 	StreamHeaderLen         = 2 // version + protocol byte
 	PaddingHeaderLen        = 2 // uint16 padding length
 	StreamFlagsLen          = 2 // uint16 stream flags
-	ResponseStatusHeaderLen = 1 // 1-byte statusSuccess / statusError
-	PacketLengthHeaderLen   = 2 // uint16 packet payload length
-	PaddingFlagLen          = 1 // 1-byte padding flag
-	StreamRequestVersionLen = 1 // 1-byte stream request version field
+	ResponseStatusHeaderLen = 1    // 1-byte statusSuccess / statusError
+	PacketLengthHeaderLen   = 2    // uint16 packet payload length
+	PaddingFlagLen          = 1    // 1-byte padding flag
+	StreamRequestVersionLen = 1    // 1-byte stream request version field
+	MaxErrorMessageLen      = 4096 // maximum length of error message strings in responses
 
 	DefaultDestinationDomain = "sp.mux.sing-box.arpa"
 	DefaultDestinationPort   = 444
@@ -190,6 +191,24 @@ type StreamResponse struct {
 	Message string
 }
 
+func readVStringBounded(reader io.Reader, maxLen int) (string, error) {
+	length, err := rw.ReadUVariant(reader)
+	if err != nil {
+		return "", err
+	}
+	if length > uint64(maxLen) {
+		return "", E.New("vstring length exceeds limit: ", length)
+	}
+	if length == 0 {
+		return "", nil
+	}
+	b := make([]byte, int(length))
+	if _, err = io.ReadFull(reader, b); err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 func ReadStreamResponse(reader io.Reader) (*StreamResponse, error) {
 	var statusBuf [ResponseStatusHeaderLen]byte
 	if _, err := io.ReadFull(reader, statusBuf[:]); err != nil {
@@ -198,7 +217,7 @@ func ReadStreamResponse(reader io.Reader) (*StreamResponse, error) {
 	response := StreamResponse{Status: statusBuf[0]}
 	if response.Status == statusError {
 		var err error
-		response.Message, err = rw.ReadVString(reader)
+		response.Message, err = readVStringBounded(reader, MaxErrorMessageLen)
 		if err != nil {
 			return nil, err
 		}

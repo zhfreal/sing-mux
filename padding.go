@@ -136,7 +136,7 @@ func (c *paddingConn) write(p []byte) (n int, err error) {
 		binary.BigEndian.PutUint16(header[:PaddingOriginalSizeLen], uint16(len(p)))
 		binary.BigEndian.PutUint16(header[PaddingOriginalSizeLen:], uint16(paddingLen))
 		common.Must1(buffer.Write(p))
-		buffer.Extend(paddingLen)
+		clear(buffer.Extend(paddingLen))
 		_, err = c.ExtendedConn.Write(buffer.Bytes())
 		if c.writePadding >= kFirstPaddings {
 			c.writePaddingDone.Store(true)
@@ -227,7 +227,7 @@ func (c *paddingConn) WriteBuffer(buffer *buf.Buffer) error {
 		header := buffer.ExtendHeader(PaddingHeaderLength)
 		binary.BigEndian.PutUint16(header[:PaddingOriginalSizeLen], uint16(bufferLen))
 		binary.BigEndian.PutUint16(header[PaddingOriginalSizeLen:], uint16(paddingLen))
-		buffer.Extend(paddingLen)
+		clear(buffer.Extend(paddingLen))
 		err := c.ExtendedConn.WriteBuffer(buffer)
 		if c.writePadding >= kFirstPaddings {
 			c.writePaddingDone.Store(true)
@@ -277,7 +277,7 @@ func (c *vectorisedPaddingConn) WriteVectorised(buffers []*buf.Buffer) error {
 		binary.BigEndian.PutUint16(hdrBytes[:PaddingOriginalSizeLen], uint16(bufferLen))
 		binary.BigEndian.PutUint16(hdrBytes[PaddingOriginalSizeLen:], uint16(paddingLen))
 		padding := buf.NewSize(paddingLen)
-		padding.Extend(paddingLen)
+		clear(padding.Extend(paddingLen))
 		allBuffers := make([]*buf.Buffer, 0, len(buffers)+PaddingVectorExtraBuffers)
 		allBuffers = append(allBuffers, header)
 		allBuffers = append(allBuffers, buffers...)

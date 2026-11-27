@@ -139,7 +139,7 @@ func ReadBrutalResponse(reader io.Reader, wantV2 bool) (resp BrutalExchangeRespo
 		return resp, false, err
 	}
 	if status[0] == BrutalStatusError {
-		msg, rErr := rw.ReadVString(reader)
+		msg, rErr := readVStringBounded(reader, MaxErrorMessageLen)
 		if rErr != nil {
 			return resp, false, rErr
 		}

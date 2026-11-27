@@ -236,7 +236,7 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 		if ok {
 			if swapped {
 				c.stateMu.Lock()
-				writeBuf := c.firstWriteBuffer
+				writeBuf := append([]byte(nil), c.firstWriteBuffer...)
 				c.stateMu.Unlock()
 
 				_, writeErr := c.write(writeBuf, true)
@@ -287,33 +287,38 @@ func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 		return c.getConn().Write(b)
 	}
 	c.lazyInit()
-	c.stateMu.Lock()
-	if !isReplay && !c.responseRead && c.client != nil && c.retryCount < c.getMaxStreamSwapRetries() {
-		if len(c.firstWriteBuffer)+len(b) <= c.getMaxHandshakeBufferCapacity() {
-			c.firstWriteBuffer = append(c.firstWriteBuffer, b...)
-		} else {
-			c.client = nil
-			c.ctx = nil
-			c.firstWriteBuffer = nil
-		}
-	}
-	c.stateMu.Unlock()
-
 	writeBuf := b
 	for {
 		c.stateMu.Lock()
-		for c.retrying && !isReplay {
-			c.retryCond.Wait()
-		}
-		c.connMu.RLock()
-		if c.closed {
+		for {
+			c.connMu.RLock()
+			closed := c.closed
 			c.connMu.RUnlock()
-			c.stateMu.Unlock()
-			return 0, net.ErrClosed
+			if closed {
+				c.stateMu.Unlock()
+				return 0, net.ErrClosed
+			}
+			if c.retrying && !isReplay {
+				c.retryCond.Wait()
+				continue
+			}
+			if !c.requestWritten && c.requestWriting {
+				c.requestWriteCond.Wait()
+				continue
+			}
+			break
 		}
-		c.connMu.RUnlock()
-		for !c.requestWritten && c.requestWriting {
-			c.requestWriteCond.Wait()
+		if !isReplay {
+			if !c.responseRead && c.client != nil && c.retryCount < c.getMaxStreamSwapRetries() {
+				if len(c.firstWriteBuffer)+len(b) <= c.getMaxHandshakeBufferCapacity() {
+					c.firstWriteBuffer = append(c.firstWriteBuffer, b...)
+				} else {
+					c.client = nil
+					c.ctx = nil
+					c.firstWriteBuffer = nil
+				}
+			}
+			writeBuf = b
 		}
 		if c.requestWritten {
 			c.stateMu.Unlock()
@@ -324,7 +329,7 @@ func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 				if ok {
 					if swapped {
 						c.stateMu.Lock()
-						writeBuf = c.firstWriteBuffer
+						writeBuf = append([]byte(nil), c.firstWriteBuffer...)
 						c.stateMu.Unlock()
 						isReplay = true
 						continue
@@ -386,7 +391,7 @@ func (c *clientConn) write(b []byte, isReplay bool) (n int, err error) {
 		if ok {
 			if swapped {
 				c.stateMu.Lock()
-				writeBuf = c.firstWriteBuffer
+				writeBuf = append([]byte(nil), c.firstWriteBuffer...)
 				c.stateMu.Unlock()
 				isReplay = true
 				continue

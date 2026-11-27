@@ -1,11 +1,11 @@
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
-github.com/zhfreal/sing v0.5.10-0.20261125005639-d6d53d30c901 h1:Ky1ku1Js8iNZLrzuDuNLS1L0SgTj0Ga3WSbR7eWGbdI=
-github.com/zhfreal/sing v0.5.10-0.20261125005639-d6d53d30c901/go.mod h1:H3pAcRIyb32TxxEUjgEHbdY7ck3twSQJ9PWSTvT5ORE=
-github.com/zhfreal/smux v1.5.51-0.20261125011022-d5b9372ce684 h1:NPEcGbv2zqzTUxOPYHEfTj/7HsHGZFgmD3EY8Jkla6U=
-github.com/zhfreal/smux v1.5.51-0.20261125011022-d5b9372ce684/go.mod h1:SjkKoGf/IyUaFyI7/rXXnNE555NwTrSE00Gtz33ZWgw=
-github.com/zhfreal/yamux v0.0.0-20261125010829-029265411adc h1:YJqxE95Yz8Q8v63CimZ2HbMzVSemj2uXVatFzoJjjvY=
-github.com/zhfreal/yamux v0.0.0-20261125010829-029265411adc/go.mod h1:sA8V38PbB2Uf3PUjTfw4HHtVnDl6c7xk2CnKgfEkh28=
+github.com/zhfreal/sing v0.5.10-0.20261127064707-9ba267e5c2a1 h1:ncPwN95HeEQtFTPnooAtcX6VAC3GsQDoIIornjGKEjE=
+github.com/zhfreal/sing v0.5.10-0.20261127064707-9ba267e5c2a1/go.mod h1:H3pAcRIyb32TxxEUjgEHbdY7ck3twSQJ9PWSTvT5ORE=
+github.com/zhfreal/smux v1.5.51-0.20261127070556-4b295ae8f4df h1:YjZRxCoSDz+Y93c+i2tfEOu69emJWoerrg0UijGcW84=
+github.com/zhfreal/smux v1.5.51-0.20261127070556-4b295ae8f4df/go.mod h1:/xad4ZMDJ19gcFpMXrg5IXECuvc+4SLfi7kyw1yGhu0=
+github.com/zhfreal/yamux v0.0.0-20261127064844-a1bb256cc823 h1:PIMNX9WcEwCGGrTOZZkK7qPcGmaWp9YqaHpZsau9yv8=
+github.com/zhfreal/yamux v0.0.0-20261127064844-a1bb256cc823/go.mod h1:MOWpm15P1C9BKv/l7tWiC9J92uG+V3/HnhUVW3gqiy8=
 go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
 go.yaml.in/yaml/v3 v3.0.5/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
 golang.org/x/net v0.62.0 h1:18ELalfM5+XNRwzM2nYqXsZQ9ByS1uhj2O/U7+5jqRY=

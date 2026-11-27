@@ -20,6 +20,8 @@ type ServiceHandler interface {
 	N.UDPConnectionHandler
 }
 
+const defaultMaxConcurrentStreamsPerSession = 1024
+
 type Service struct {
 	newStreamContext    func(context.Context, net.Conn) context.Context
 	logger              logger.ContextLogger
@@ -30,6 +32,7 @@ type Service struct {
 	maxReceiveBuffer    int
 	maxStreamBuffer     int
 	maxStreamWindowSize uint32
+	maxStreams          int
 }
 
 type ServiceOptions struct {
@@ -42,6 +45,7 @@ type ServiceOptions struct {
 	MaxReceiveBuffer    any
 	MaxStreamBuffer     any
 	MaxStreamWindowSize any
+	MaxStreams          int
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
@@ -62,6 +66,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 		maxReceiveBuffer:    ParseBytes(options.MaxReceiveBuffer),
 		maxStreamBuffer:     ParseBytes(options.MaxStreamBuffer),
 		maxStreamWindowSize: clampUint32(ParseBytes(options.MaxStreamWindowSize)),
+		maxStreams:          options.MaxStreams,
 	}, nil
 }
 
@@ -79,6 +84,11 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.M
 	if err != nil {
 		return err
 	}
+	maxStreams := s.maxStreams
+	if maxStreams <= 0 {
+		maxStreams = defaultMaxConcurrentStreamsPerSession
+	}
+	streamSem := make(chan struct{}, maxStreams)
 	var group task.Group
 	group.Append0(func(_ context.Context) error {
 		for {
@@ -86,11 +96,21 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.M
 			if aErr != nil {
 				return aErr
 			}
+			select {
+			case streamSem <- struct{}{}:
+			default:
+				_ = stream.Close()
+				if s.logger != nil {
+					s.logger.WarnContext(ctx, "sing-mux: concurrent stream limit reached (", maxStreams, "), rejecting stream")
+				}
+				continue
+			}
 			streamCtx := ctx
 			if s.newStreamContext != nil {
 				streamCtx = s.newStreamContext(ctx, stream)
 			}
 			go func() {
+				defer func() { <-streamSem }()
 				hErr := s.newConnection(streamCtx, conn, stream, metadata)
 				if hErr != nil && s.logger != nil {
 					s.logger.ErrorContext(streamCtx, E.Cause(hErr, "handle connection"))
@@ -110,11 +130,17 @@ func (s *Service) newConnection(ctx context.Context, sessionConn net.Conn, strea
 	} else {
 		stream = &wrapStream{Conn: stream}
 	}
+	_ = stream.SetReadDeadline(time.Now().Add(DefaultTCPTimeout))
+	handshakeTimer := time.AfterFunc(DefaultTCPTimeout, func() {
+		_ = stream.Close()
+	})
 	request, err := ReadStreamRequest(stream)
+	handshakeTimer.Stop()
 	if err != nil {
 		_ = stream.Close()
 		return E.Cause(err, "read multiplex stream request")
 	}
+	_ = stream.SetReadDeadline(time.Time{})
 	defer stream.Close()
 	metadata.Destination = request.Destination
 	if request.Network == N.NetworkTCP {
